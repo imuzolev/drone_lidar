@@ -1,0 +1,82 @@
+# AADNS - Advanced Autonomous Drone Navigation System
+# Cursor AI Rules & Project Context
+
+## Project Overview
+This is an autonomous drone navigation system that uses Colosseum (AirSim fork) 
+with Unreal Engine 5.2 for simulation. The drone flies in a 3D environment with 
+obstacle avoidance, trajectory visualization, and map exploration capabilities.
+
+## CRITICAL Setup Instructions
+When a user opens this project for the first time, guide them through setup:
+
+### 1. Python Environment
+```powershell
+# Create and activate virtual environment
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+
+# Install dependencies
+pip install -r requirements.txt
+
+# CRITICAL: Install Colosseum AirSim client (NOT 'pip install airsim'!)
+pip install git+https://github.com/CodexLabsLLC/Colosseum.git#subdirectory=PythonClient
+
+# CRITICAL: numpy must be < 2.0
+pip install "numpy<2.0"
+```
+
+### 2. Unreal Engine 5.2 + Colosseum Plugin
+- Install Unreal Engine 5.2 via Epic Games Launcher
+- Clone Colosseum: https://github.com/CodexLabsLLC/Colosseum
+- Build Colosseum plugin for UE5.2 (see Colosseum docs)
+- Create Blocks project or use existing UE5 project with AirSim plugin
+- Place the Unreal project in `unreal/Blocks/` folder
+
+### 3. AirSim Settings
+Create file: `C:\Users\<USERNAME>\Documents\AirSim\settings.json`
+```json
+{
+  "SettingsVersion": 1.2,
+  "SimMode": "Multirotor",
+  "Vehicles": {
+    "Drone1": {
+      "VehicleType": "SimpleFlight",
+      "X": 0, "Y": 0, "Z": 0
+    }
+  }
+}
+```
+
+## Running the Project
+1. Open Unreal Engine project and press Play
+2. Run: `python src/main.py` (GUI with Start/Stop buttons)
+3. Or: `python src/test_square_flight.py` (simple test)
+
+## Code Rules
+- Before editing any file, ensure venv is activated
+- All AirSim coordinates use NED system (Z negative = up)
+- Altitude values in code are positive, converted to negative Z internally
+- The airsim package import is actually Colosseum's client, not the original airsim
+- Use `client.simPlotLineStrip()` for trajectory visualization in UE5
+- Use `client.simGetCollisionInfo()` for obstacle detection
+
+## Project Structure
+- `src/main.py` - Main GUI application with drone control
+- `src/main.py::AirSimController` - Core drone controller with:
+  - `fly_square()` - Square pattern flight
+  - `explore_map()` - Map exploration with obstacle avoidance
+  - `draw_trajectory_line()` - Red trajectory in UE5
+  - `move_with_obstacle_avoidance()` - Collision detection + avoidance
+- `src/test_square_flight.py` - Standalone square flight test
+- `src/decision_maker.py` - Neural network for decisions (PyTorch)
+- `src/navigation.py` - Navigation with Kalman filter
+- `src/sensor.py` - Sensor simulation
+- `src/obstacle.py` - Obstacle detection
+- `src/user_interface.py` - Tkinter GUI panel
+
+## Current Flight Parameters
+- Altitude: 3 meters
+- Speed: 1.5 m/s
+- Obstacle detection threshold: 2 meters
+- Avoidance behavior: Stop -> Backup 1.5m -> Turn Left 90° -> Continue
+- Trajectory: Red line drawn in UE5 in real-time

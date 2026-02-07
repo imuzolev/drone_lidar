@@ -46,9 +46,9 @@ class WeatherInteraction:
             return True
 
 # Example usage can be :  with API key and city
-api_key = "your_api_key_here"
-weather_interaction = WeatherInteraction(api_key)
-city = "New York"
-weather_data = weather_interaction.get_weather_data(city)
-user_decision = True  # Simulate user input
-flight_ready = weather_interaction.evaluate_weather_conditions(weather_data, user_decision)
+# api_key = "your_api_key_here"
+# weather_interaction = WeatherInteraction(api_key)
+# city = "New York"
+# weather_data = weather_interaction.get_weather_data(city)
+# user_decision = True  # Simulate user input
+# flight_ready = weather_interaction.evaluate_weather_conditions(weather_data, user_decision)

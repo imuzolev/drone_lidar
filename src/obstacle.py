@@ -9,9 +9,15 @@ class ObstacleDetector:
     """
     Uses computer vision and LiDAR data to detect and avoid obstacles in the drone's path.
     """
-    def __init__(self, camera_model_path, lidar_model_path):
-        self.camera_model = self.load_model(camera_model_path, 'camera')
-        self.lidar_model = self.load_model(lidar_model_path, 'lidar')
+    def __init__(self, camera_model_path=None, lidar_model_path=None, simulation_mode=True):
+        self.simulation_mode = simulation_mode
+        if not simulation_mode:
+            self.camera_model = self.load_model(camera_model_path, 'camera')
+            self.lidar_model = self.load_model(lidar_model_path, 'lidar')
+        else:
+            self.camera_model = None
+            self.lidar_model = None
+            print("[ObstacleDetector] Running in simulation mode")
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
@@ -23,8 +29,9 @@ class ObstacleDetector:
         Load a pre-trained deep learning model from the specified path.
         """
         try:
-            model = models.resnet50(pretrained=True)
-            model.load_state_dict(torch.load(model_path))
+            model = models.resnet50(weights='IMAGENET1K_V1')
+            if model_path:
+                model.load_state_dict(torch.load(model_path))
             model.eval()
             return model
         except Exception as e:
@@ -34,6 +41,10 @@ class ObstacleDetector:
         """
         Detect obstacles using the camera model.
         """
+        if self.simulation_mode:
+            # Simulation: return random obstacle data
+            num_obstacles = np.random.randint(0, 3)
+            return [{"type": "obstacle", "distance": np.random.uniform(5, 50)} for _ in range(num_obstacles)]
         try:
             image = Image.open(camera_image).convert('RGB')
             image_tensor = self.transform(image).unsqueeze(0)

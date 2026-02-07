@@ -7,10 +7,16 @@ class SensorInput:
     """
     Manages the acquisition of data from various sensors installed on the drone, including cameras and LiDAR.
     """
-    def __init__(self, camera_index, lidar_config):
-        self.camera = self.initialize_camera(camera_index)
-        self.lidar_config = lidar_config
-        self.initialize_lidar()
+    def __init__(self, camera_index=0, lidar_config=None, simulation_mode=True):
+        self.simulation_mode = simulation_mode
+        if not simulation_mode:
+            self.camera = self.initialize_camera(camera_index)
+            self.lidar_config = lidar_config
+            self.initialize_lidar()
+        else:
+            self.camera = None
+            self.lidar_config = lidar_config
+            print("[SensorInput] Running in simulation mode")
 
     def initialize_camera(self, camera_index):
         """
@@ -36,6 +42,10 @@ class SensorInput:
         """
         Capture an image frame from the camera.
         """
+        if self.simulation_mode:
+            # Simulation: return a dummy image
+            dummy_image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+            return Image.fromarray(dummy_image)
         ret, frame = self.camera.read()
         if not ret:
             raise SensorError("Failed to read from camera")
@@ -55,8 +65,10 @@ class SensorInput:
         """
         Release hardware resources properly to ensure a clean shutdown.
         """
-        self.camera.release()
-        cv2.destroyAllWindows()
+        if not self.simulation_mode and self.camera:
+            self.camera.release()
+            cv2.destroyAllWindows()
+        print("[SensorInput] Resources released")
 
 # Example usage can be:
 # try:

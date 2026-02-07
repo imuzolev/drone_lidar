@@ -1,84 +1,183 @@
-# Advanced Autonomous Drone Navigation System (AADNS) by Nikul Ram
+# AADNS - Advanced Autonomous Drone Navigation System
 
-## IMPORTANT NOTICE  
-This project is licensed under the MIT License.
+Автономная система навигации дрона с симуляцией в Unreal Engine 5.2 через Colosseum (форк AirSim).
 
-If you use, fork, or modify this code, you **must** retain the original copyright notice  
-and **credit the author, Nikul Ram**, in any copies or public versions.
+## Возможности
 
-Failure to comply with these terms may result in a formal takedown request in accordance with the license.
+- Полёт по заданным маршрутам (квадрат, змейка)
+- Исследование карты с обходом препятствий
+- Визуализация траектории красной линией в UE5 в реальном времени
+- Обнаружение препятствий на расстоянии 2м
+- Автоматическое избегание: остановка → отход → поворот влево → продолжение
+- GUI панель управления (Tkinter)
+- Нейросеть принятия решений (PyTorch)
+- Навигация с фильтром Калмана
+- Шифрование связи, управление энергией, рой дронов
 
-## Overview
-The Advanced Autonomous Drone Navigation System (AADNS) is a sophisticated initiative leveraging cutting-edge technologies in AI, machine learning, and simulation to develop highly advanced autonomous drone capabilities. Designed for complex environmental interactions and adaptive flight path management, it aims to push the boundaries of what autonomous drones can achieve in realistic and simulated settings.
+## Быстрая установка
 
-## Features
-- **Real-Time Obstacle Detection**: Utilizes advanced sensors and AI to dynamically detect and avoid obstacles.
-- **Environmental Interaction**: Engages with simulated environments to test response scenarios and improve navigational tactics.
-- **Adaptive Flight Path Management**: Algorithms dynamically adjust the drone's flight path based on real-time data.
-- **Simulation Integration**: Compatible with AirSim and Gazebo for high-fidelity simulation and testing.
-- **Safety and Emergency Protocols**: Robust mechanisms to handle emergency scenarios effectively.
+### Вариант 1: Автоматическая (рекомендуется)
 
+```powershell
+# PowerShell
+.\setup.ps1
+```
 
-## Planned Enhancements
-I am continuously working to improve the system's capabilities. Future enhancements include the integration of advanced pathfinding algorithms such as A* and Dijkstra’s. These enhancements will be integrated into the project's `navigation.py` file and will provide more efficient and optimized pathfinding solutions.
+или
 
-**Note:** For detailed information on future enhancements and the planned implementation of A* and Dijkstra's algorithms, please refer to the `Future_Enhancements.md` file in the `docs` folder. This will give the users an idea on how the, "example usage" can look like.
+```batch
+# CMD
+setup.bat
+```
 
-**Future Enhancements updates will be posted in `Future_Enhancements.md` file in the `docs` folder.** 
+### Вариант 2: Ручная
 
-## Installation
-Ensure you have the following prerequisites installed:
-- Python 3.8 or later
-- Unreal Engine
-- AirSim or Gazebo
+```powershell
+# 1. Создать виртуальное окружение
+python -m venv venv
+.\venv\Scripts\Activate.ps1
 
-Clone the repository:
-git clone https://github.com/nikulram/Advanced-Autonomous-Drone-Navigation-System.git
-
-cd Advanced-Autonomous-Drone-Navigation-System
+# 2. Установить зависимости
 pip install -r requirements.txt
 
-## Usage
-To start the simulation environment:
-python main.py
+# 3. ВАЖНО: Установить Colosseum клиент (НЕ pip install airsim!)
+pip uninstall airsim -y
+pip install git+https://github.com/CodexLabsLLC/Colosseum.git#subdirectory=PythonClient
 
-Replace main.py with the script configured to launch your simulation environment, tailored to your specific setup in either AirSim or Gazebo.
+# 4. Убедиться что numpy < 2.0
+pip install "numpy<2.0"
+```
 
-## Testing
-All testing files are located within the same directory as their corresponding modules. To run tests, navigate to the file directory and execute:
+## Настройка Unreal Engine
 
-python test_module_name.py
+### 1. Установить Unreal Engine 5.2
+- Скачать Epic Games Launcher: https://www.unrealengine.com/
+- Установить UE 5.2.x
 
-Ensure that your testing environment is configured to mimic the operational conditions expected during the simulation.
+### 2. Собрать Colosseum плагин
+```powershell
+git clone https://github.com/CodexLabsLLC/Colosseum.git
+cd Colosseum
+# Следовать инструкциям: https://codexlabsllc.github.io/Colosseum/build_windows/
+```
 
-## Contributing
-Interested in contributing? Great! Please follow the next steps:
+### 3. Создать проект
+- Создать UE5 проект типа "Blocks" с подключённым AirSim плагином
+- Или использовать готовый проект из `unreal/Blocks/` (не включён в репозиторий из-за размера)
 
-Fork the repository.
-Create your feature branch (git checkout -b feature/AmazingFeature).
-Commit your changes (git commit -m 'Add some AmazingFeature').
-Push to the branch (git push origin feature/AmazingFeature).
-Open a Pull Request.
+### 4. Настроить AirSim
 
-## Documentation
-For a detailed explanation of the project's architecture, development phases, and more, see the Advanced Autonomous Drone Navigation System [Documentation](docs/Advanced_Autonomous_Drone_Navigation_System_Documentation_v1.0.pdf) located in the docs folder.
+Создать файл `C:\Users\<ВАШ_ПОЛЬЗОВАТЕЛЬ>\Documents\AirSim\settings.json`:
 
-## License
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+```json
+{
+  "SettingsVersion": 1.2,
+  "SimMode": "Multirotor",
+  "Vehicles": {
+    "Drone1": {
+      "VehicleType": "SimpleFlight",
+      "X": 0, "Y": 0, "Z": 0
+    }
+  }
+}
+```
 
-## Acknowledgements
-AirSim and Unreal Engine for simulation capabilities.
-Python and its vast ecosystem for backend development.
-The contributors and maintainers of all used open-source software.
-Special thanks to Hamna Khalid for giving valuable tips and guidance on enhancing the documentation(Advanced_Autonomous_Drone_Navigation_System_Documentation_v1.0) part of this project.   
+## Запуск
 
-## References
-"Flying Free: A Research Overview of Deep Learning in Drone Navigation," available at MDPI.
-"Artificial Intelligence Approaches for UAV Navigation: Recent Advances," available at IEEE Xplore.
-"Drone Navigation and Target Interception Using Deep Reinforcement Learning," available at IEEE Xplore.
-"Vision-Based Navigation Techniques for Drones," available at MDPI.
-"Integration of Weather Data into UAV Decision Making," available at AMETSOC.
-"Enhancements in GPS Technology for UAV Navigation and Positioning," available at Springer.
-"Simulation of UAV Systems Using Gazebo," available at ScienceDirect.
-"AirSim: High-Fidelity Visual and Physical Simulation for Autonomous Vehicles," available at ArXiv.
-Mark Rober's "Vortex Cannon vs Drone," available on YouTube.
+```powershell
+# 1. Открыть Unreal Engine проект и нажать Play
+
+# 2. Активировать venv
+.\venv\Scripts\Activate.ps1
+
+# 3. Запустить GUI
+python src\main.py
+
+# Или простой тест полёта по квадрату
+python src\test_square_flight.py
+```
+
+В GUI нажмите **Start** для начала полёта.
+
+## Параметры полёта (src/main.py)
+
+| Параметр | Значение | Описание |
+|----------|----------|----------|
+| `FLIGHT_ALTITUDE` | 3 м | Высота полёта |
+| `FLIGHT_SPEED` | 1.5 м/с | Скорость |
+| `MAP_SIZE_X` | 30 м | Область исследования X |
+| `MAP_SIZE_Y` | 30 м | Область исследования Y |
+| `LINE_SPACING` | 5 м | Шаг между линиями сканирования |
+| Obstacle threshold | 2 м | Дистанция обнаружения препятствий |
+
+## Структура проекта
+
+```
+├── src/
+│   ├── main.py                  # GUI + контроллер дрона + исследование карты
+│   ├── test_square_flight.py    # Простой тест полёта по квадрату
+│   ├── test_colosseum.py        # Тест подключения к симулятору
+│   ├── decision_maker.py        # Нейросеть принятия решений (PyTorch)
+│   ├── decision_net.py          # Архитектура нейросети
+│   ├── navigation.py            # Навигация (фильтр Калмана)
+│   ├── sensor.py                # Модуль датчиков
+│   ├── obstacle.py              # Обнаружение препятствий
+│   ├── flight_plan.py           # Планирование маршрута (A*)
+│   ├── frequency_hopper.py      # Частотный хоппинг связи
+│   ├── drone_encryption.py      # Шифрование
+│   ├── energy_management.py     # Управление энергией
+│   ├── emergency.py             # Аварийные процедуры
+│   ├── drone_swarm.py           # Управление роем
+│   ├── weather_interaction.py   # Взаимодействие с погодой
+│   ├── user_interface.py        # Tkinter GUI панель
+│   └── exceptions.py            # Пользовательские исключения
+├── unreal/                      # UE5 проект (не в репозитории)
+├── requirements.txt             # Python зависимости
+├── setup.ps1                    # Автоустановка (PowerShell)
+├── setup.bat                    # Автоустановка (CMD)
+├── CONTEXT_SUMMARY.md           # Контекст проекта
+├── .cursorrules                 # Правила для Cursor AI
+└── .gitignore
+```
+
+## API Reference (AirSim/Colosseum)
+
+```python
+import airsim
+
+client = airsim.MultirotorClient()
+client.confirmConnection()
+client.enableApiControl(True)
+client.armDisarm(True)
+client.takeoffAsync().join()
+
+# Движение (NED: z отрицательный = вверх)
+client.moveToPositionAsync(x, y, -altitude, speed).join()
+
+# Получить позицию
+state = client.getMultirotorState()
+pos = state.kinematics_estimated.position
+
+# Обнаружение столкновений
+collision = client.simGetCollisionInfo()
+if collision.has_collided: ...
+
+# Визуализация траектории
+client.simPlotLineStrip([p1, p2], color_rgba=[1,0,0,1], thickness=8, is_persistent=True)
+
+client.landAsync().join()
+```
+
+## Требования
+
+- **Python** 3.11+
+- **Unreal Engine** 5.2
+- **Colosseum** (форк AirSim от CodexLabsLLC)
+- **Windows** 10/11
+- **GPU** с поддержкой DirectX 11 (для UE5)
+
+## Ссылки
+
+- [Colosseum GitHub](https://github.com/CodexLabsLLC/Colosseum)
+- [Colosseum Docs](https://codexlabsllc.github.io/Colosseum/)
+- [AirSim API Reference](https://codexlabsllc.github.io/Colosseum/api_docs/html/)

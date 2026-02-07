@@ -75,9 +75,10 @@ def weather_impact_on_signal_quality(quality):
     """
     return quality * 0.9  #suppose weather reduces signal quality by 10%
 
-frequencies = [2.4, 2.425, 2.45, 2.475, 2.5]  # Possible frequencies in GHz
-hopper = AdaptiveFrequencyHopper(frequencies, weather_impact_callback=weather_impact_on_signal_quality)
-hopper.user_override_hopping(True)  # Enable user control over frequency hopping
-while True:
-    hopper.check_and_hop()
-    time.sleep(1)  # Regular interval check
+# Commented out to prevent blocking on import
+# frequencies = [2.4, 2.425, 2.45, 2.475, 2.5]  # Possible frequencies in GHz
+# hopper = AdaptiveFrequencyHopper(frequencies, weather_impact_callback=weather_impact_on_signal_quality)
+# hopper.user_override_hopping(True)  # Enable user control over frequency hopping
+# while True:
+#     hopper.check_and_hop()
+#     time.sleep(1)  # Regular interval check
