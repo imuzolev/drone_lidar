@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 .cursor/
 terminals/
+# Generated artifacts
+*.log
+*.ply
 # Exclude large project folders
 unreal/
 unity/

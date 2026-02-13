@@ -24,6 +24,7 @@ from emergency import EmergencyHandler
 from drone_swarm import DroneSwarm
 from weather_interaction import WeatherInteraction
 from exceptions import CriticalNavigationError, SensorError
+from autonomous_exploration import AutonomousExplorer
 
 
 class AirSimController:
@@ -728,21 +729,23 @@ class DroneNavigationSystem:
         self.operation_thread.start()
 
     def start_operation(self):
-        """Main operational loop - explore map with trajectory visualization."""
+        """Main operational loop - grid-based room exploration with obstacle avoidance."""
         self.running = True
         
-        # Exploration flight parameters
-        MAP_SIZE_X = 30      # meters - exploration area width
-        MAP_SIZE_Y = 30      # meters - exploration area height
-        LINE_SPACING = 5     # meters - distance between scan lines
-        FLIGHT_ALTITUDE = 3  # meters - low altitude for detailed scanning
-        FLIGHT_SPEED = 1.5   # m/s - slow speed for stability
+        # Exploration parameters
+        ROOM_SIZE = 30        # meters - room dimension (square)
+        CELL_SIZE = 2.0       # meters - grid cell size
+        FLIGHT_ALTITUDE = 3   # meters - flight altitude
+        FLIGHT_SPEED = 1.5    # m/s - slow speed for stability
+        SAFE_DISTANCE = 3.0   # meters - minimum distance from walls
         
         try:
             self.ui.log_data("=" * 50)
-            self.ui.log_data("MAP EXPLORATION MISSION")
-            self.ui.log_data(f"Area: {MAP_SIZE_X}m x {MAP_SIZE_Y}m")
+            self.ui.log_data("GRID-BASED ROOM EXPLORATION")
+            self.ui.log_data(f"Room: {ROOM_SIZE}m x {ROOM_SIZE}m")
+            self.ui.log_data(f"Grid: {int(ROOM_SIZE/CELL_SIZE)}x{int(ROOM_SIZE/CELL_SIZE)} cells")
             self.ui.log_data(f"Altitude: {FLIGHT_ALTITUDE}m, Speed: {FLIGHT_SPEED}m/s")
+            self.ui.log_data(f"Safe distance: {SAFE_DISTANCE}m")
             self.ui.log_data("Red trajectory line will be drawn in UE5!")
             self.ui.log_data("=" * 50)
             
@@ -756,35 +759,35 @@ class DroneNavigationSystem:
                 self.ui.log_data("[ERROR] AirSim not available!")
                 return
             
-            # Takeoff
-            self.ui.log_data("Taking off...")
-            if self.airsim_controller.takeoff():
-                self.ui.log_data("[SUCCESS] Drone is airborne!")
-            else:
-                self.ui.log_data("[ERROR] Takeoff failed!")
-                return
-            
-            # Explore map with trajectory drawing
-            self.ui.log_data("-" * 50)
-            self.airsim_controller.explore_map(
-                map_size_x=MAP_SIZE_X,
-                map_size_y=MAP_SIZE_Y,
+            # Create grid-based explorer with the connected AirSim client
+            explorer = AutonomousExplorer(
+                client=self.airsim_controller.client,
+                room_size=ROOM_SIZE,
+                cell_size=CELL_SIZE,
                 altitude=FLIGHT_ALTITUDE,
                 speed=FLIGHT_SPEED,
-                line_spacing=LINE_SPACING,
+                safe_distance=SAFE_DISTANCE
+            )
+            
+            # Run full exploration (takeoff -> explore -> return home -> land)
+            explorer.run(
                 log_callback=self.ui.log_data,
                 running_check=lambda: self.running
             )
-            self.ui.log_data("-" * 50)
             
-            # Mission complete
-            self.ui.log_data("Mission completed successfully!")
+            # Mark controller as not flying (explorer handles landing)
+            self.airsim_controller.flying = False
+            
+            self.ui.log_data("=" * 50)
+            self.ui.log_data("Mission completed! Room fully explored.")
             self.ui.log_data("Trajectory is visible as red line in UE5!")
+            self.ui.log_data("=" * 50)
                 
         except Exception as e:
             self.ui.log_data(f"Error during operation: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
-            self.ui.log_data("Landing...")
             self.cleanup_operations()
 
     def handle_operation_error(self, error):
@@ -801,8 +804,8 @@ class DroneNavigationSystem:
 
     def cleanup_operations(self):
         """Clean up resources and ensure system is in a safe state before closing."""
-        # Land drone if connected to AirSim
-        if self.airsim_enabled:
+        # Land drone if it's still flying (explorer may have already landed)
+        if self.airsim_enabled and self.airsim_controller.flying:
             self.ui.log_data("Landing drone...")
             self.airsim_controller.land()
             self.ui.log_data("Drone landed.")
