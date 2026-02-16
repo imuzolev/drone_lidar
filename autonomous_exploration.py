@@ -6,10 +6,11 @@ Flies a systematic lawnmower pattern across the entire map, performs
 avoids obstacles, and returns home after full coverage.
 
 Exploration phases:
-  Phase 1 - Initial 360° scan to detect room bounds and obstacles.
-  Phase 2 - Lawnmower (boustrophedon) coverage flight with 360° scans.
-  Phase 3 - BFS cleanup pass to visit any missed free cells.
-  Phase 4 - Return to start with smooth descent and landing.
+  Phase 1 - Initial 360 scan to detect room bounds and obstacles.
+  Phase 2 - Perimeter pass along room boundaries (edges & corners).
+  Phase 3 - Interior lawnmower (boustrophedon) coverage flight with scans.
+  Phase 4 - Limited BFS cleanup pass for remaining small gaps.
+  Phase 5 - Return to start with smooth descent and landing.
 
 Usage:
     python autonomous_exploration.py                      # Real AirSim
@@ -25,6 +26,7 @@ import math
 from collections import deque
 import sys
 import argparse
+import threading
 
 try:
     from scipy.spatial import KDTree
@@ -37,7 +39,13 @@ try:
 except ImportError:
     airsim = None
 
-import mock_airsim
+try:
+    import mock_airsim
+except ImportError:
+    try:
+        from src import mock_airsim
+    except ImportError:
+        mock_airsim = None
 
 # Grid cell states
 UNEXPLORED = 0
@@ -183,6 +191,88 @@ class AutonomousExplorer:
         self.client.confirmConnection()
 
     # ================================================================
+    #  ASYNC JOIN WITH TIMEOUT
+    # ================================================================
+
+    def _join_with_timeout(self, task, timeout=30.0, task_name="task"):
+        """Join an async AirSim task with a timeout.
+
+        AirSim's .join() can block forever when the drone enters hover-
+        for-safety mode or cannot reach the target.  This wrapper runs
+        .join() on a daemon thread and waits up to *timeout* seconds.
+        If the task does not finish in time it is cancelled and the
+        drone is stabilised in hover mode.
+
+        Returns True if the task completed normally, False on timeout.
+        """
+        completed = threading.Event()
+
+        def _wait():
+            try:
+                task.join()
+            except Exception:
+                pass
+            finally:
+                completed.set()
+
+        t = threading.Thread(target=_wait, daemon=True)
+        t.start()
+
+        if completed.wait(timeout=timeout):
+            return True
+
+        # Timeout reached
+        self.log(f"  [TIMEOUT] '{task_name}' exceeded {timeout:.0f}s — cancelling.")
+        try:
+            self.client.cancelLastTask()
+        except Exception:
+            pass
+        try:
+            self.client.hoverAsync()
+        except Exception:
+            pass
+        time.sleep(0.3)
+        return False
+
+    def _move_timeout(self, distance, speed):
+        """Calculate a reasonable timeout for a move command (seconds)."""
+        if speed <= 0:
+            speed = 0.5
+        return max(10.0, (distance / speed) * 3.0 + 5.0)
+
+    def _wait_for_stable(self, timeout=2.0, vel_threshold=0.15):
+        """Wait until drone velocity drops below threshold (stabilized hover).
+
+        Prevents lidar collection while the drone is still oscillating
+        after a move or rotation command, which would cause point cloud
+        smearing and distortions.
+
+        Returns True if stabilized within timeout, False otherwise.
+        """
+        if self.use_mock:
+            time.sleep(0.1)
+            return True
+
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                state = self.client.simGetGroundTruthKinematics()
+                vx = state.linear_velocity.x_val
+                vy = state.linear_velocity.y_val
+                vz = state.linear_velocity.z_val
+                speed = math.sqrt(vx * vx + vy * vy + vz * vz)
+
+                av = state.angular_velocity
+                ang_speed = math.sqrt(av.x_val**2 + av.y_val**2 + av.z_val**2)
+
+                if speed < vel_threshold and ang_speed < 0.1:
+                    return True
+            except Exception:
+                break
+            time.sleep(0.05)
+        return False
+
+    # ================================================================
     #  GRID CONFIGURATION
     # ================================================================
 
@@ -207,10 +297,12 @@ class AutonomousExplorer:
         for i in range(max(4, self.scan_rotations)):
             yaw = i * angle_step
             try:
-                self.client.rotateToYawAsync(yaw, 0.5).join()
+                task = self.client.rotateToYawAsync(yaw, 10.0)
+                self._join_with_timeout(task, timeout=8.0, task_name="auto_room_rotate")
             except Exception:
                 pass
-            time.sleep(0.15)
+            self._wait_for_stable(timeout=1.0, vel_threshold=0.15)
+            time.sleep(0.1)
             pts = self.get_lidar_points_world()
             if len(pts) > 0:
                 all_pts.append(pts)
@@ -221,11 +313,11 @@ class AutonomousExplorer:
 
         world_pts = np.concatenate(all_pts, axis=0)
 
-        # Use 5th/95th percentile to exclude far-away outliers
-        x_lo = float(np.percentile(world_pts[:, 0], 5))
-        x_hi = float(np.percentile(world_pts[:, 0], 95))
-        y_lo = float(np.percentile(world_pts[:, 1], 5))
-        y_hi = float(np.percentile(world_pts[:, 1], 95))
+        # Use 2nd/98th percentile to preserve edges/corners while removing outliers
+        x_lo = float(np.percentile(world_pts[:, 0], 2))
+        x_hi = float(np.percentile(world_pts[:, 0], 98))
+        y_lo = float(np.percentile(world_pts[:, 1], 2))
+        y_hi = float(np.percentile(world_pts[:, 1], 98))
         span_x = x_hi - x_lo
         span_y = y_hi - y_lo
         detected_size = max(span_x, span_y) + 2.0 * self.auto_room_padding
@@ -330,8 +422,22 @@ class AutonomousExplorer:
     #  LIDAR PROCESSING
     # ================================================================
 
+    def _get_orientation_quaternion(self):
+        """Get current orientation as (w, x, y, z) quaternion using ground truth."""
+        if not self.use_mock and self.client:
+            try:
+                state = self.client.simGetGroundTruthKinematics()
+                o = state.orientation
+                return o.w_val, o.x_val, o.y_val, o.z_val
+            except Exception:
+                pass
+        state = self.client.getMultirotorState()
+        o = state.kinematics_estimated.orientation
+        return o.w_val, o.x_val, o.y_val, o.z_val
+
     def get_lidar_points_world(self):
         """Get lidar point cloud converted to world coordinates.
+        Uses full quaternion rotation for accurate body-to-world transform.
         Applies per-scan noise filtering: NaN removal, range gating.
         Returns numpy array (N, 3)."""
         try:
@@ -357,18 +463,19 @@ class AutonomousExplorer:
         if len(points) == 0:
             return np.array([]).reshape(0, 3)
 
-        # Transform to world coordinates
-        yaw = self.get_yaw()
-        cos_y = math.cos(yaw)
-        sin_y = math.sin(yaw)
+        # Full quaternion rotation for accurate body-to-world transform
+        qw, qx, qy, qz = self._get_orientation_quaternion()
         x, y, z = self.get_position()
 
-        world_pts = np.zeros_like(points)
-        world_pts[:, 0] = x + points[:, 0] * cos_y - points[:, 1] * sin_y
-        world_pts[:, 1] = y + points[:, 0] * sin_y + points[:, 1] * cos_y
-        world_pts[:, 2] = z + points[:, 2]
+        R = np.array([
+            [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)],
+            [2*(qx*qy + qz*qw),     1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw)],
+            [2*(qx*qz - qy*qw),     2*(qy*qz + qx*qw),     1 - 2*(qx*qx + qy*qy)]
+        ], dtype=np.float64)
 
-        return world_pts
+        world_pts = (R @ points.astype(np.float64).T).T + np.array([x, y, z])
+
+        return world_pts.astype(np.float32)
 
     def get_distance_in_direction(self, target_x, target_y):
         """Get minimum lidar distance in direction of (target_x, target_y).
@@ -399,7 +506,7 @@ class AutonomousExplorer:
             np.cos(point_angles - body_angle)
         ))
 
-        cone_half_angle = math.radians(45.0)
+        cone_half_angle = math.radians(20.0)
         cone_mask = angle_diff < cone_half_angle
         cone_points = points[cone_mask]
 
@@ -413,10 +520,12 @@ class AutonomousExplorer:
     #  GRID MAPPING
     # ================================================================
 
-    def update_grid_from_lidar(self):
+    def update_grid_from_lidar(self, collect_for_ply=True):
         """Update occupancy grid from lidar scan.
         Marks WALL at lidar endpoints, EXPLORED along rays (free space).
-        Also accumulates points for PLY export."""
+        Only accumulates points for PLY export when collect_for_ply=True.
+        During transit, collect_for_ply should be False to avoid
+        capturing noisy points while the drone is in motion."""
         x, y, z = self.get_position()
         drone_gx, drone_gy = self.world_to_grid(x, y)
 
@@ -434,8 +543,8 @@ class AutonomousExplorer:
 
         world_pts = self.get_lidar_points_world()
 
-        # Accumulate for PLY with height-band filtering
-        if len(world_pts) > 0 and self.ply_output_path is not None:
+        # Accumulate for PLY with height-band filtering (only when stabilized)
+        if len(world_pts) > 0 and self.ply_output_path is not None and collect_for_ply:
             ply_pts = world_pts.copy()
 
             # Height-band filter: remove floor/ceiling noise
@@ -498,16 +607,20 @@ class AutonomousExplorer:
 
     def scan_full(self):
         """Rotate 360° in steps, collecting lidar at each angle.
-        Marks nearby cells as visited after scanning."""
+        Marks nearby cells as visited after scanning.
+        Waits for full stabilization before each lidar capture
+        to prevent point cloud smearing."""
         angle_step = 360.0 / self.scan_rotations
         for i in range(self.scan_rotations):
             if not self.is_running_fn():
                 break
             yaw = i * angle_step
             try:
-                self.client.rotateToYawAsync(yaw, 0.5).join()
+                task = self.client.rotateToYawAsync(yaw, 10.0)
+                self._join_with_timeout(task, timeout=8.0, task_name="scan_rotate")
             except Exception:
                 pass
+            self._wait_for_stable(timeout=1.5, vel_threshold=0.1)
             time.sleep(0.15)
             self.update_grid_from_lidar()
 
@@ -531,8 +644,66 @@ class AutonomousExplorer:
                         self.visited[ngx][ngy] = True
 
     # ================================================================
+    #  ADAPTIVE SCANNING
+    # ================================================================
+
+    def _unexplored_ratio_at(self, gx, gy):
+        """Ratio of UNEXPLORED cells within visit_radius of a grid position.
+        Uses numpy slicing for speed on large grids."""
+        r = int(self.visit_radius / self.cell_size) + 2
+        min_gx = max(0, gx - r)
+        max_gx = min(self.grid_dim - 1, gx + r)
+        min_gy = max(0, gy - r)
+        max_gy = min(self.grid_dim - 1, gy + r)
+        subgrid = self.grid[min_gx:max_gx + 1, min_gy:max_gy + 1]
+        total = subgrid.size
+        unexplored = int(np.sum(subgrid == UNEXPLORED))
+        return unexplored / max(1, total)
+
+    def scan_adaptive(self):
+        """Adaptive 360° scan: full rotation in unmapped areas, reduced in
+        well-mapped areas.  Always collects lidar at each orientation so PLY
+        point-cloud density is preserved."""
+        x, y, _ = self.get_position()
+        gx, gy = self.world_to_grid(x, y)
+        ratio = self._unexplored_ratio_at(gx, gy)
+
+        if ratio > 0.15:
+            rotations = self.scan_rotations          # full (default 12)
+        elif ratio > 0.05:
+            rotations = max(6, self.scan_rotations * 2 // 3)  # ~8
+        else:
+            rotations = max(4, self.scan_rotations // 2)       # ~6
+
+        angle_step = 360.0 / rotations
+        for i in range(rotations):
+            if not self.is_running_fn():
+                break
+            yaw = i * angle_step
+            try:
+                task = self.client.rotateToYawAsync(yaw, 10.0)
+                self._join_with_timeout(task, timeout=8.0, task_name="adaptive_rotate")
+            except Exception:
+                pass
+            self._wait_for_stable(timeout=1.5, vel_threshold=0.1)
+            time.sleep(0.15)
+            self.update_grid_from_lidar()
+
+        self.mark_cells_visited()
+        self.record_trajectory()
+
+    # ================================================================
     #  COVERAGE PATH GENERATION (LAWNMOWER)
     # ================================================================
+
+    def is_location_reachable(self, gx, gy):
+        """Lightweight reachability check for waypoint planning.
+        Only verifies the target cell itself is not a wall.
+        Runtime obstacle avoidance in navigate_to_cell() handles
+        proximity to walls — no need to over-filter at planning stage."""
+        if not (0 <= gx < self.grid_dim and 0 <= gy < self.grid_dim):
+            return False
+        return self.grid[gx][gy] != WALL
 
     def is_location_safe(self, gx, gy):
         """Check if grid cell is safe (far enough from known walls).
@@ -573,16 +744,68 @@ class AutonomousExplorer:
                 
         return True
 
-    def generate_coverage_waypoints(self):
-        """Generate lawnmower/boustrophedon waypoints for systematic map coverage.
-        Filters out waypoints that are too close to known walls.
-        """
-        # Margin keeps waypoints safely inside the room away from walls
-        margin = self.safe_distance + self.cell_size
+    def _generate_perimeter_waypoints(self):
+        """Generate waypoints along the room perimeter for edge/corner coverage.
+        Starts from the nearest corner and traverses all 4 edges."""
+        margin = max(self.safe_distance * 0.5, self.cell_size)
         min_x = self.world_min_x + margin
         max_x = self.world_min_x + self.room_size - margin
         min_y = self.world_min_y + margin
         max_y = self.world_min_y + self.room_size - margin
+
+        spacing = self.coverage_spacing
+        x, y, _ = self.get_position()
+
+        corners = [
+            (min_x, min_y), (max_x, min_y),
+            (max_x, max_y), (min_x, max_y)
+        ]
+        nearest_idx = min(range(4), key=lambda i:
+            (corners[i][0] - x)**2 + (corners[i][1] - y)**2)
+        ordered = corners[nearest_idx:] + corners[:nearest_idx]
+
+        waypoints = []
+        for ci in range(4):
+            c1 = ordered[ci]
+            c2 = ordered[(ci + 1) % 4]
+            dx = c2[0] - c1[0]
+            dy = c2[1] - c1[1]
+            edge_len = math.sqrt(dx * dx + dy * dy)
+            n_steps = max(1, int(edge_len / spacing))
+            for s in range(n_steps + 1):
+                t = s / max(1, n_steps)
+                wx = c1[0] + dx * t
+                wy = c1[1] + dy * t
+                waypoints.append((wx, wy))
+
+        # Remove near-duplicate points
+        filtered = [waypoints[0]]
+        for wp in waypoints[1:]:
+            if math.sqrt((wp[0] - filtered[-1][0])**2 +
+                         (wp[1] - filtered[-1][1])**2) > spacing * 0.4:
+                filtered.append(wp)
+
+        # Filter by reachability
+        valid = []
+        for wx, wy in filtered:
+            gx, gy = self.world_to_grid(wx, wy)
+            if self.is_location_reachable(gx, gy):
+                valid.append((wx, wy))
+
+        return valid
+
+    def _generate_interior_waypoints(self):
+        """Generate interior boustrophedon (lawnmower) waypoints.
+        Offset from the perimeter to avoid overlap, uses relaxed safety check."""
+        margin = max(self.safe_distance * 0.5, self.cell_size)
+        interior_off = self.coverage_spacing
+        min_x = self.world_min_x + margin + interior_off
+        max_x = self.world_min_x + self.room_size - margin - interior_off
+        min_y = self.world_min_y + margin + interior_off
+        max_y = self.world_min_y + self.room_size - margin - interior_off
+
+        if min_x >= max_x or min_y >= max_y:
+            return []
 
         spacing = self.coverage_spacing
         raw_waypoints = []
@@ -607,17 +830,132 @@ class AutonomousExplorer:
             y += spacing
             forward = not forward
 
-        # Filter waypoints based on known map (Phase 1 results)
-        valid_waypoints = []
+        # Filter by relaxed reachability
+        valid = []
         for wx, wy in raw_waypoints:
             gx, gy = self.world_to_grid(wx, wy)
-            if self.is_location_safe(gx, gy):
-                valid_waypoints.append((wx, wy))
-            else:
-                # Optional: try to nudge waypoint? For now just skip.
-                pass
-                
-        return valid_waypoints
+            if self.is_location_reachable(gx, gy):
+                valid.append((wx, wy))
+
+        return valid
+
+    def generate_coverage_waypoints(self):
+        """Generate full coverage waypoints: perimeter + interior lawnmower.
+        Filters out waypoints near known walls."""
+        return self._generate_perimeter_waypoints() + self._generate_interior_waypoints()
+
+    # ================================================================
+    #  OBSTACLE CIRCUMNAVIGATION
+    # ================================================================
+
+    def _detect_internal_obstacles(self):
+        """Detect clusters of WALL cells that are internal obstacles
+        (not part of the room perimeter walls).
+
+        Uses flood-fill (BFS) to group connected WALL cells into clusters.
+        Filters out clusters that touch the grid boundary (room walls).
+
+        Returns:
+            List of clusters, each cluster is a list of (gx, gy) tuples.
+        """
+        wall_mask = (self.grid == WALL)
+        visited_cells = np.zeros_like(wall_mask, dtype=bool)
+        clusters = []
+        border = 2  # cells from edge considered "perimeter"
+
+        for gx in range(self.grid_dim):
+            for gy in range(self.grid_dim):
+                if wall_mask[gx, gy] and not visited_cells[gx, gy]:
+                    cluster = []
+                    touches_border = False
+                    queue = deque([(gx, gy)])
+                    visited_cells[gx, gy] = True
+
+                    while queue:
+                        cx, cy = queue.popleft()
+                        cluster.append((cx, cy))
+
+                        if (cx < border or cx >= self.grid_dim - border or
+                                cy < border or cy >= self.grid_dim - border):
+                            touches_border = True
+
+                        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1),
+                                       (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+                            nx, ny = cx + dx, cy + dy
+                            if (0 <= nx < self.grid_dim and
+                                    0 <= ny < self.grid_dim and
+                                    wall_mask[nx, ny] and
+                                    not visited_cells[nx, ny]):
+                                visited_cells[nx, ny] = True
+                                queue.append((nx, ny))
+
+                    if not touches_border and len(cluster) >= 1:
+                        clusters.append(cluster)
+
+        return clusters
+
+    def _obstacle_centroid_and_radius(self, cluster):
+        """Compute centroid (world coords) and effective radius of a cluster."""
+        coords = np.array(cluster, dtype=float)
+        mean_gx = coords[:, 0].mean()
+        mean_gy = coords[:, 1].mean()
+        cx, cy = self.grid_to_world(int(round(mean_gx)), int(round(mean_gy)))
+
+        max_dist = 0.0
+        for gx, gy in cluster:
+            wx, wy = self.grid_to_world(gx, gy)
+            d = math.sqrt((wx - cx) ** 2 + (wy - cy) ** 2)
+            if d > max_dist:
+                max_dist = d
+
+        return cx, cy, max_dist + self.cell_size * 0.5
+
+    def _generate_obstacle_circumnavigation_waypoints(self):
+        """Generate waypoints around each internal obstacle so the drone
+        can scan all sides.
+
+        For each obstacle cluster:
+          1. Find centroid and radius.
+          2. Place waypoints in a circle at (radius + safe_distance + margin).
+          3. Use 8 evenly spaced angles (every 45°) for full coverage.
+          4. Filter out unreachable / wall waypoints.
+
+        Returns:
+            List of (obstacle_label, waypoints) tuples.
+        """
+        clusters = self._detect_internal_obstacles()
+        if not clusters:
+            return []
+
+        self.log(f"[OBSTACLES] Detected {len(clusters)} internal obstacle(s)")
+
+        all_obstacle_wps = []
+        orbit_angles = 8  # scan from 8 directions (every 45°)
+        margin = max(self.safe_distance, self.cell_size * 2.0)
+
+        for idx, cluster in enumerate(clusters):
+            cx, cy, radius = self._obstacle_centroid_and_radius(cluster)
+            orbit_dist = radius + margin
+            self.log(f"[OBSTACLES] Obstacle {idx + 1}: center=({cx:.1f}, {cy:.1f}), "
+                     f"radius={radius:.1f}m, orbit={orbit_dist:.1f}m")
+
+            waypoints = []
+            for ai in range(orbit_angles):
+                angle = ai * (2.0 * math.pi / orbit_angles)
+                wx = cx + orbit_dist * math.cos(angle)
+                wy = cy + orbit_dist * math.sin(angle)
+
+                gx, gy = self.world_to_grid(wx, wy)
+                if (0 <= gx < self.grid_dim and 0 <= gy < self.grid_dim
+                        and self.is_location_reachable(gx, gy)):
+                    waypoints.append((wx, wy))
+
+            if waypoints:
+                all_obstacle_wps.append((f"Obstacle_{idx + 1}", waypoints))
+                self.log(f"[OBSTACLES] Obstacle {idx + 1}: "
+                         f"{len(waypoints)}/{orbit_angles} waypoints reachable")
+
+        return all_obstacle_wps
 
     # ================================================================
     #  PATH PLANNING
@@ -648,12 +986,18 @@ class AutonomousExplorer:
                 return path
 
             gx, gy = current
-            for dgx, dgy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+            for dgx, dgy in [(1,0),(-1,0),(0,1),(0,-1),
+                              (1,1),(1,-1),(-1,1),(-1,-1)]:
                 nx, ny = gx + dgx, gy + dgy
                 nb = (nx, ny)
                 if (0 <= nx < self.grid_dim and 0 <= ny < self.grid_dim
                         and nb not in seen
                         and self.grid[nx][ny] != WALL):
+                    # Prevent diagonal corner-cutting through walls
+                    if abs(dgx) + abs(dgy) == 2:
+                        if (self.grid[gx + dgx][gy] == WALL or
+                                self.grid[gx][gy + dgy] == WALL):
+                            continue
                     seen.add(nb)
                     parent[nb] = current
                     queue.append(nb)
@@ -684,12 +1028,17 @@ class AutonomousExplorer:
                 path.reverse()
                 return path
 
-            for dgx, dgy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+            for dgx, dgy in [(1,0),(-1,0),(0,1),(0,-1),
+                              (1,1),(1,-1),(-1,1),(-1,-1)]:
                 nx, ny = gx + dgx, gy + dgy
                 nb = (nx, ny)
                 if (0 <= nx < self.grid_dim and 0 <= ny < self.grid_dim
                         and nb not in seen
                         and self.grid[nx][ny] != WALL):
+                    if abs(dgx) + abs(dgy) == 2:
+                        if (self.grid[gx + dgx][gy] == WALL or
+                                self.grid[gx][gy + dgy] == WALL):
+                            continue
                     seen.add(nb)
                     parent[nb] = current
                     queue.append(nb)
@@ -729,6 +1078,25 @@ class AutonomousExplorer:
 
         return True
 
+    def _simplify_path(self, path):
+        """Remove redundant intermediate waypoints from a BFS grid path.
+        Keeps start and end; drops points where a straight line-of-sight
+        exists between non-adjacent nodes.  Greatly reduces stop-and-go."""
+        if len(path) <= 2:
+            return path
+        simplified = [path[0]]
+        i = 0
+        while i < len(path) - 1:
+            farthest = i + 1
+            for j in range(len(path) - 1, i + 1, -1):
+                if self._grid_line_clear(path[i][0], path[i][1],
+                                         path[j][0], path[j][1]):
+                    farthest = j
+                    break
+            simplified.append(path[farthest])
+            i = farthest
+        return simplified
+
     # ================================================================
     #  NAVIGATION
     # ================================================================
@@ -754,9 +1122,11 @@ class AutonomousExplorer:
         t = (wall_dist - self.safe_distance) / (slow_zone - self.safe_distance)
         return min_speed + t * (self.speed - min_speed)
 
-    def navigate_to_cell(self, target_gx, target_gy):
+    def navigate_to_cell(self, target_gx, target_gy, skip_yaw=False):
         """Move drone to grid cell center with adaptive speed.
         Flies as close to obstacles as possible, slowing down near walls.
+        When skip_yaw=True, skips yaw rotation for smoother transit paths
+        (multirotors can fly in any direction without facing it).
         Returns True if reached, False if truly blocked."""
         target_x, target_y = self.grid_to_world(target_gx, target_gy)
         x, y, z = self.get_position()
@@ -815,29 +1185,40 @@ class AutonomousExplorer:
         # Calculate adaptive speed
         fly_speed = self._adaptive_speed(wall_dist)
 
-        # Rotate toward target
-        yaw_deg = math.degrees(math.atan2(actual_target_y - y,
-                                           actual_target_x - x))
-        try:
-            self.client.rotateToYawAsync(yaw_deg, 0.5).join()
-        except Exception:
-            pass
+        # Rotate toward target (skip during transit for smoother path)
+        if not skip_yaw:
+            yaw_deg = math.degrees(math.atan2(actual_target_y - y,
+                                               actual_target_x - x))
+            try:
+                task = self.client.rotateToYawAsync(yaw_deg, 10.0)
+                self._join_with_timeout(task, timeout=5.0, task_name="nav_rotate")
+            except Exception:
+                pass
 
         # Fly at adaptive speed
-        self.client.moveToPositionAsync(
+        fly_dist = math.sqrt((actual_target_x - x)**2 + (actual_target_y - y)**2)
+        move_task = self.client.moveToPositionAsync(
             float(actual_target_x), float(actual_target_y),
             float(self.target_altitude), float(fly_speed)
-        ).join()
+        )
+        if not self._join_with_timeout(move_task,
+                                       timeout=self._move_timeout(fly_dist, fly_speed),
+                                       task_name="nav_move"):
+            self.log("  [NAV] Move timed out, entering hover mode for safety")
+            self.record_trajectory()
+            return False
 
         # Post-flight collision check
         try:
             collision = self.client.simGetCollisionInfo()
             if collision.has_collided:
                 self.log("  [COLLISION] Backing up...")
-                self.client.moveToPositionAsync(
+                backup_task = self.client.moveToPositionAsync(
                     float(x), float(y),
                     float(self.target_altitude), 1.0
-                ).join()
+                )
+                self._join_with_timeout(backup_task, timeout=15.0,
+                                        task_name="collision_backup")
                 self.grid[target_gx][target_gy] = WALL
                 self.record_trajectory()
                 return False
@@ -845,6 +1226,7 @@ class AutonomousExplorer:
             pass
 
         self.record_trajectory()
+        self._wait_for_stable(timeout=1.0, vel_threshold=0.2)
         return True
 
     def navigate_to_world(self, target_x, target_y):
@@ -879,9 +1261,9 @@ class AutonomousExplorer:
         # Try direct flight if grid line is clear
         if self._grid_line_clear(start_gx, start_gy, target_gx, target_gy):
             wx, wy = self.grid_to_world(target_gx, target_gy)
-            success = self.navigate_to_cell(target_gx, target_gy)
+            success = self.navigate_to_cell(target_gx, target_gy, skip_yaw=True)
             if success:
-                self.update_grid_from_lidar()
+                self.update_grid_from_lidar(collect_for_ply=False)
                 self.mark_cells_visited()
                 return True
 
@@ -890,26 +1272,28 @@ class AutonomousExplorer:
         if path is None:
             return False
 
-        # Follow path, scanning periodically
-        scan_interval = max(1, int(self.coverage_spacing / self.cell_size))
+        # Simplify path: remove redundant intermediate waypoints
+        path = self._simplify_path(path)
+
+        # Follow path smoothly: skip yaw rotation and PLY during transit
+        # to avoid choppy movement and noisy point cloud data.
+        # PLY collection happens only during dedicated 360° scans.
         for i, (gx, gy) in enumerate(path[1:], 1):
             if not self.is_running_fn():
                 return False
 
-            success = self.navigate_to_cell(gx, gy)
+            success = self.navigate_to_cell(gx, gy, skip_yaw=True)
             if not success:
-                # Re-scan and try to replan
-                self.update_grid_from_lidar()
+                self.update_grid_from_lidar(collect_for_ply=False)
                 self.mark_cells_visited()
                 return False
 
-            # Collect lidar along the path
-            if i % scan_interval == 0:
-                self.update_grid_from_lidar()
-                self.mark_cells_visited()
+            self.update_grid_from_lidar(collect_for_ply=False)
+            self.mark_cells_visited()
 
-        # Final lidar collection at destination
-        self.update_grid_from_lidar()
+        # Stabilize at destination before returning (scan will follow)
+        self._wait_for_stable(timeout=1.5, vel_threshold=0.15)
+        self.update_grid_from_lidar(collect_for_ply=False)
         self.mark_cells_visited()
         return True
 
@@ -920,7 +1304,13 @@ class AutonomousExplorer:
     def takeoff(self):
         """Take off and ascend to exploration altitude."""
         self.log("[FLIGHT] Taking off...")
-        self.client.takeoffAsync().join()
+        takeoff_task = self.client.takeoffAsync()
+        if not self._join_with_timeout(takeoff_task, timeout=20.0,
+                                       task_name="takeoff"):
+            self.log("[FLIGHT] Takeoff timed out — retrying once...")
+            takeoff_task = self.client.takeoffAsync()
+            self._join_with_timeout(takeoff_task, timeout=15.0,
+                                    task_name="takeoff_retry")
 
         state = self.client.getMultirotorState()
         self.start_position = state.kinematics_estimated.position
@@ -930,12 +1320,14 @@ class AutonomousExplorer:
         self.record_trajectory()
 
         self.log(f"[FLIGHT] Ascending to {abs(self.target_altitude):.0f}m...")
-        self.client.moveToPositionAsync(
+        ascend_task = self.client.moveToPositionAsync(
             self.start_position.x_val,
             self.start_position.y_val,
             self.target_altitude,
             2.0
-        ).join()
+        )
+        self._join_with_timeout(ascend_task, timeout=20.0,
+                                task_name="ascend_to_altitude")
         self.record_trajectory()
         self.log("[FLIGHT] At target altitude. Ready to explore.")
 
@@ -957,18 +1349,21 @@ class AutonomousExplorer:
 
         if not success:
             self.log("[FLIGHT] Grid navigation failed. Executing High-Altitude Return...")
-            # Ascend to a safer altitude (e.g., 5m higher than current target)
-            # Remember NED: negative is up. So subtract 5.0.
             safe_alt = min(self.target_altitude - 5.0, -10.0)
-            
+
             self.log(f"[FLIGHT] Ascending to safe altitude {abs(safe_alt):.1f}m...")
-            self.client.moveToPositionAsync(x, y, safe_alt, 2.0).join()
-            
+            t1 = self.client.moveToPositionAsync(x, y, safe_alt, 2.0)
+            self._join_with_timeout(t1, timeout=20.0, task_name="rth_ascend")
+
+            fly_dist = math.sqrt((sx - x)**2 + (sy - y)**2)
             self.log(f"[FLIGHT] Flying over to start...")
-            self.client.moveToPositionAsync(sx, sy, safe_alt, self.speed).join()
-            
+            t2 = self.client.moveToPositionAsync(sx, sy, safe_alt, self.speed)
+            self._join_with_timeout(t2, timeout=self._move_timeout(fly_dist, self.speed),
+                                    task_name="rth_fly_over")
+
             self.log(f"[FLIGHT] Descending to approach altitude...")
-            self.client.moveToPositionAsync(sx, sy, self.target_altitude, 2.0).join()
+            t3 = self.client.moveToPositionAsync(sx, sy, self.target_altitude, 2.0)
+            self._join_with_timeout(t3, timeout=20.0, task_name="rth_descend")
 
         self.record_trajectory()
 
@@ -985,20 +1380,26 @@ class AutonomousExplorer:
         while current_alt > 0.8:
             current_alt *= 0.5
             self.log(f"[FLIGHT] Descending to {current_alt:.1f}m...")
-            self.client.moveToPositionAsync(
+            desc_task = self.client.moveToPositionAsync(
                 sx, sy, float(-current_alt), 0.8
-            ).join()
+            )
+            self._join_with_timeout(desc_task, timeout=15.0,
+                                    task_name="gradual_descent")
             time.sleep(0.2)
 
         self.log("[FLIGHT] Descending to 0.3m...")
-        self.client.moveToPositionAsync(sx, sy, -0.3, 0.5).join()
+        final_desc = self.client.moveToPositionAsync(sx, sy, -0.3, 0.5)
+        self._join_with_timeout(final_desc, timeout=15.0,
+                                task_name="final_descent")
         time.sleep(0.2)
         self.record_trajectory()
 
         # Land with timeout
         self.log("[FLIGHT] Landing...")
         try:
-            self.client.landAsync().join()
+            land_task = self.client.landAsync()
+            self._join_with_timeout(land_task, timeout=30.0,
+                                    task_name="landing")
         except Exception as e:
             self.log(f"[FLIGHT] Landing exception (non-critical): {e}")
         self.record_trajectory()
@@ -1241,13 +1642,14 @@ class AutonomousExplorer:
 
     def explore_loop(self):
         """
-        Full-coverage exploration in three phases:
+        Full-coverage exploration in structured phases:
 
-        Phase 1 - Initial 360° scan from start to detect bounds/walls.
-        Phase 2 - Systematic lawnmower flight with 360° scans at each
-                  waypoint for dense, complete point cloud.
-        Phase 3 - BFS cleanup for any free cells missed by the lawnmower
-                  (areas behind obstacles, etc.).
+        Phase 1 - Initial 360 scan from start to detect bounds/walls.
+        Phase 2 - Perimeter pass: fly along room boundaries for
+                  guaranteed edge/corner coverage (clean rectangle).
+        Phase 3 - Interior lawnmower flight with scans at each waypoint
+                  (clean systematic rows).
+        Phase 4 - Limited BFS cleanup for any remaining small gaps.
         """
 
         # ---- Phase 1: Initial full scan ----
@@ -1263,83 +1665,175 @@ class AutonomousExplorer:
                  f"cells visited, {int(np.sum(self.grid == WALL))} wall cells")
         self.print_grid(compact=True)
 
-        # ---- Phase 2: Systematic lawnmower coverage ----
+        # ---- Phase 2: Perimeter pass ----
         self.log("")
         self.log("=" * 60)
-        self.log("  PHASE 2: Systematic lawnmower coverage flight")
+        self.log("  PHASE 2: Perimeter pass (edges & corners)")
         self.log("=" * 60)
 
-        waypoints = self.generate_coverage_waypoints()
-        total_wp = len(waypoints)
-        self.log(f"[PHASE 2] Generated {total_wp} coverage waypoints "
-                 f"(spacing={self.coverage_spacing}m)")
+        perimeter_wps = self._generate_perimeter_waypoints()
+        total_perim = len(perimeter_wps)
+        self.log(f"[PHASE 2] Generated {total_perim} perimeter waypoints")
 
-        reached = 0
-        skipped = 0
-        nav_failures = 0
-        max_consec_fail = 10  # re-scan after N consecutive failures
-
-        for i, (wx, wy) in enumerate(waypoints):
+        p_reached = 0
+        p_skipped = 0
+        for i, (wx, wy) in enumerate(perimeter_wps):
             if not self.is_running_fn():
                 self.log("[PHASE 2] Stopped by user.")
                 break
 
             gx, gy = self.world_to_grid(wx, wy)
-
-            # Safety check: skip if target is a wall OR too close to a wall
-            if not self.is_location_safe(gx, gy):
-                skipped += 1
-                nav_failures += 1
-                # If we skip many points, maybe we are stuck or map is wrong -> Rescan
-                if nav_failures >= max_consec_fail:
-                    self.log(f"[PHASE 2] {nav_failures} consecutive unsafe targets, rescanning...")
-                    self.scan_full()
-                    nav_failures = 0
+            if self.grid[gx][gy] == WALL:
+                p_skipped += 1
                 continue
 
-            # Navigate to waypoint — always fly, even if "visited"
+            success = self.navigate_to_world(wx, wy)
+            if success:
+                p_reached += 1
+                self._wait_for_stable(timeout=2.0, vel_threshold=0.1)
+                self.scan_adaptive()
+            else:
+                p_skipped += 1
+
+            if (i + 1) % 5 == 0 or i == total_perim - 1:
+                visited_count = int(np.sum(self.visited & (self.grid == EXPLORED)))
+                free_count = int(np.sum(self.grid == EXPLORED))
+                pct = 100 * visited_count / max(1, free_count)
+                self.log(f"[PHASE 2] Perimeter WP {i+1}/{total_perim} | "
+                         f"Reached: {p_reached} Skipped: {p_skipped} | "
+                         f"Coverage: {pct:.0f}%")
+
+        self.log(f"[PHASE 2] Perimeter complete. Reached: {p_reached}, "
+                 f"Skipped: {p_skipped}")
+        self.print_grid(compact=True)
+
+        # ---- Phase 3: Interior lawnmower coverage ----
+        self.log("")
+        self.log("=" * 60)
+        self.log("  PHASE 3: Systematic interior lawnmower coverage")
+        self.log("=" * 60)
+
+        waypoints = self._generate_interior_waypoints()
+        total_wp = len(waypoints)
+        self.log(f"[PHASE 3] Generated {total_wp} interior waypoints "
+                 f"(spacing={self.coverage_spacing}m)")
+
+        reached = 0
+        skipped = 0
+        nav_failures = 0
+        max_consec_fail = 10
+        max_rescans = 3
+        rescans_done = 0
+
+        for i, (wx, wy) in enumerate(waypoints):
+            if not self.is_running_fn():
+                self.log("[PHASE 3] Stopped by user.")
+                break
+
+            gx, gy = self.world_to_grid(wx, wy)
+
+            # Skip waypoints on wall cells silently (grid data is correct,
+            # rescanning won't move the obstacle)
+            if not self.is_location_reachable(gx, gy):
+                skipped += 1
+                continue
+
             success = self.navigate_to_world(wx, wy)
 
             if success:
                 reached += 1
                 nav_failures = 0
-                # Full 360° scan at every waypoint for dense point cloud
-                self.scan_full()
+                self._wait_for_stable(timeout=2.0, vel_threshold=0.1)
+                self.scan_adaptive()
             else:
                 skipped += 1
                 nav_failures += 1
-                # After many consecutive failures, do a 360° rescan
                 if nav_failures >= max_consec_fail:
-                    self.log(f"[PHASE 2] {nav_failures} consecutive nav failures, rescanning...")
-                    self.scan_full()
+                    rescans_done += 1
+                    if rescans_done <= max_rescans:
+                        self.log(f"[PHASE 3] {nav_failures} consecutive nav failures, "
+                                 f"rescan {rescans_done}/{max_rescans}...")
+                        self.scan_full()
+                    else:
+                        self.log(f"[PHASE 3] Max rescans reached ({max_rescans}), "
+                                 f"skipping to Phase 4 cleanup.")
+                        break
                     nav_failures = 0
 
-            # Progress report every waypoint
-            visited_count = int(np.sum(self.visited & (self.grid == EXPLORED)))
-            free_count = int(np.sum(self.grid == EXPLORED))
-            pct = 100 * visited_count / max(1, free_count)
+            if (i + 1) % 10 == 0 or success:
+                visited_count = int(np.sum(self.visited & (self.grid == EXPLORED)))
+                free_count = int(np.sum(self.grid == EXPLORED))
+                pct = 100 * visited_count / max(1, free_count)
 
-            self.log(f"[PHASE 2] WP {i + 1}/{total_wp} | "
-                     f"Reached: {reached} | Skipped: {skipped} | "
-                     f"Coverage: {visited_count}/{free_count} ({pct:.0f}%)")
+                self.log(f"[PHASE 3] WP {i + 1}/{total_wp} | "
+                         f"Reached: {reached} | Skipped: {skipped} | "
+                         f"Coverage: {visited_count}/{free_count} ({pct:.0f}%)")
 
         visited_count = int(np.sum(self.visited & (self.grid == EXPLORED)))
         free_count = int(np.sum(self.grid == EXPLORED))
         pct = 100 * visited_count / max(1, free_count)
-        self.log(f"[PHASE 2] Complete. Reached: {reached}, Skipped: {skipped}")
-        self.log(f"[PHASE 2] Coverage: {visited_count}/{free_count} ({pct:.0f}%)")
+        self.log(f"[PHASE 3] Complete. Reached: {reached}, Skipped: {skipped}")
+        self.log(f"[PHASE 3] Coverage: {visited_count}/{free_count} ({pct:.0f}%)")
         self.print_grid(compact=True)
 
-        # ---- Phase 3: BFS cleanup ----
+        # ---- Phase 3.5: Obstacle circumnavigation ----
         self.log("")
         self.log("=" * 60)
-        self.log("  PHASE 3: BFS cleanup for missed areas")
+        self.log("  PHASE 3.5: Obstacle circumnavigation (scanning all sides)")
+        self.log("=" * 60)
+
+        obstacle_groups = self._generate_obstacle_circumnavigation_waypoints()
+        obs_reached = 0
+        obs_skipped = 0
+
+        if not obstacle_groups:
+            self.log("[PHASE 3.5] No internal obstacles detected — skipping.")
+        else:
+            for obs_label, obs_wps in obstacle_groups:
+                if not self.is_running_fn():
+                    self.log("[PHASE 3.5] Stopped by user.")
+                    break
+
+                self.log(f"[PHASE 3.5] Circumnavigating {obs_label} "
+                         f"({len(obs_wps)} waypoints)...")
+
+                for j, (wx, wy) in enumerate(obs_wps):
+                    if not self.is_running_fn():
+                        break
+
+                    gx, gy = self.world_to_grid(wx, wy)
+                    if self.grid[gx][gy] == WALL:
+                        obs_skipped += 1
+                        continue
+
+                    success = self.navigate_to_world(wx, wy)
+                    if success:
+                        obs_reached += 1
+                        self._wait_for_stable(timeout=2.0, vel_threshold=0.1)
+                        self.scan_full()
+                    else:
+                        obs_skipped += 1
+
+            visited_count = int(np.sum(self.visited & (self.grid == EXPLORED)))
+            free_count = int(np.sum(self.grid == EXPLORED))
+            pct = 100 * visited_count / max(1, free_count)
+            self.log(f"[PHASE 3.5] Complete. Reached: {obs_reached}, "
+                     f"Skipped: {obs_skipped}")
+            self.log(f"[PHASE 3.5] Coverage: {visited_count}/{free_count} "
+                     f"({pct:.0f}%)")
+
+        self.print_grid(compact=True)
+
+        # ---- Phase 4: Limited BFS cleanup ----
+        self.log("")
+        self.log("=" * 60)
+        self.log("  PHASE 4: BFS cleanup for remaining gaps")
         self.log("=" * 60)
 
         cleanup_steps = 0
         cleanup_fails = 0
-        max_cleanup = self.grid_dim * self.grid_dim
-        max_cleanup_fails = 15  # give up after N consecutive BFS failures
+        max_cleanup = min(40, self.grid_dim * self.grid_dim // 4)
+        max_cleanup_fails = 8
 
         while cleanup_steps < max_cleanup and cleanup_fails < max_cleanup_fails:
             if not self.is_running_fn():
@@ -1351,33 +1845,31 @@ class AutonomousExplorer:
 
             cleanup_steps += 1
 
-            # Navigate along BFS path
             target_gx, target_gy = path[-1]
             target_wx, target_wy = self.grid_to_world(target_gx, target_gy)
             success = self.navigate_to_world(target_wx, target_wy)
 
             if success:
                 cleanup_fails = 0
-                self.scan_full()
+                self._wait_for_stable(timeout=2.0, vel_threshold=0.1)
+                self.scan_adaptive()
             else:
                 cleanup_fails += 1
-                # Mark unreachable target to avoid retrying
-                if self.grid[target_gx][target_gy] == EXPLORED:
+                if self.grid[target_gx][target_gy] != WALL:
                     self.visited[target_gx][target_gy] = True
 
-            # Progress
             if cleanup_steps % 3 == 0:
                 visited_count = int(np.sum(
                     self.visited & (self.grid == EXPLORED)))
                 free_count = int(np.sum(self.grid == EXPLORED))
-                self.log(f"[PHASE 3] Step {cleanup_steps}: "
+                self.log(f"[PHASE 4] Step {cleanup_steps}: "
                          f"{visited_count}/{free_count} "
                          f"({100 * visited_count / max(1, free_count):.0f}%)")
 
         if cleanup_steps > 0:
-            self.log(f"[PHASE 3] Cleanup: {cleanup_steps} additional positions")
+            self.log(f"[PHASE 4] Cleanup: {cleanup_steps} additional positions")
         else:
-            self.log("[PHASE 3] No cleanup needed - full coverage!")
+            self.log("[PHASE 4] No cleanup needed - full coverage!")
 
         # ---- Final stats ----
         visited_count = int(np.sum(self.visited & (self.grid == EXPLORED)))
@@ -1432,7 +1924,9 @@ class AutonomousExplorer:
             traceback.print_exc()
             try:
                 self.log("[EMERGENCY] Attempting emergency landing...")
-                self.client.landAsync().join()
+                emg_task = self.client.landAsync()
+                self._join_with_timeout(emg_task, timeout=20.0,
+                                        task_name="emergency_land")
             except Exception:
                 pass
         finally:
@@ -1465,19 +1959,19 @@ if __name__ == "__main__":
                         help="Flight altitude in meters (default: 2)")
     parser.add_argument("--speed", type=float, default=2.0,
                         help="Flight speed m/s (default: 2)")
-    parser.add_argument("--safe-distance", type=float, default=2.0,
-                        help="Min obstacle distance in meters (default: 2.0)")
+    parser.add_argument("--safe-distance", type=float, default=1.5,
+                        help="Min obstacle distance in meters (default: 1.5)")
     parser.add_argument("--no-auto-room", action="store_false", dest="auto_room_size",
                         help="Disable auto-detection of room size (default: auto-enabled)")
     parser.set_defaults(auto_room_size=True)
-    parser.add_argument("--auto-room-padding", type=float, default=1.0,
-                        help="Extra map padding (default: 1)")
-    parser.add_argument("--scan-rotations", type=int, default=12,
-                        help="Rotation steps for 360 scan (default: 12)")
-    parser.add_argument("--visit-radius", type=float, default=2.5,
-                        help="Radius to mark cells visited (default: 2.5)")
-    parser.add_argument("--coverage-spacing", type=float, default=3.0,
-                        help="Lawnmower row spacing in meters (default: 3)")
+    parser.add_argument("--auto-room-padding", type=float, default=2.0,
+                        help="Extra map padding (default: 2)")
+    parser.add_argument("--scan-rotations", type=int, default=16,
+                        help="Rotation steps for 360 scan (default: 16)")
+    parser.add_argument("--visit-radius", type=float, default=3.0,
+                        help="Radius to mark cells visited (default: 3.0)")
+    parser.add_argument("--coverage-spacing", type=float, default=2.5,
+                        help="Lawnmower row spacing in meters (default: 2.5)")
     parser.add_argument("--ply-output", type=str, default="point_cloud.ply",
                         help="Output PLY file (default: point_cloud.ply)")
     parser.add_argument("--ply-voxel", type=float, default=0.05,

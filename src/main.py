@@ -1,5 +1,5 @@
 import tkinter as tk
-from threading import Thread
+from threading import Thread, Event
 import time
 
 # AirSim integration
@@ -36,7 +36,29 @@ class AirSimController:
         self.flying = False
         self.move_speed = 3  # m/s
         self.move_distance = 2  # meters per command
-        
+
+    @staticmethod
+    def _join_with_timeout(task, timeout=30.0, label="task"):
+        """Join an AirSim async task with a timeout to prevent infinite hangs."""
+        done = Event()
+
+        def _wait():
+            try:
+                task.join()
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        t = Thread(target=_wait, daemon=True)
+        t.start()
+
+        if done.wait(timeout=timeout):
+            return True
+
+        print(f"[TIMEOUT] '{label}' exceeded {timeout:.0f}s — cancelling.")
+        return False
+
     def connect(self):
         """Connect to AirSim simulator."""
         if not AIRSIM_AVAILABLE:
@@ -58,7 +80,8 @@ class AirSimController:
         try:
             self.client.enableApiControl(True)
             self.client.armDisarm(True)
-            self.client.takeoffAsync().join()
+            task = self.client.takeoffAsync()
+            self._join_with_timeout(task, timeout=20.0, label="takeoff")
             self.flying = True
             return True
         except Exception as e:
@@ -70,7 +93,8 @@ class AirSimController:
         if not self.connected:
             return False
         try:
-            self.client.landAsync().join()
+            task = self.client.landAsync()
+            self._join_with_timeout(task, timeout=30.0, label="land")
             self.client.armDisarm(False)
             self.client.enableApiControl(False)
             self.flying = False
@@ -86,9 +110,10 @@ class AirSimController:
         try:
             if speed is None:
                 speed = self.move_speed
-            self.client.moveToPositionAsync(
+            task = self.client.moveToPositionAsync(
                 float(x), float(y), float(z), float(speed)
-            ).join()
+            )
+            self._join_with_timeout(task, timeout=60.0, label="move_to_position")
             return True
         except Exception as e:
             print(f"[AirSim] Move failed: {e}")
@@ -103,9 +128,10 @@ class AirSimController:
             pos = state.kinematics_estimated.position
             # NED: negative z = up, so altitude 10m = z=-10
             target_z = -abs(altitude_meters)
-            self.client.moveToPositionAsync(
+            task = self.client.moveToPositionAsync(
                 float(pos.x_val), float(pos.y_val), float(target_z), float(self.move_speed)
-            ).join()
+            )
+            self._join_with_timeout(task, timeout=30.0, label="go_to_altitude")
             return True
         except Exception as e:
             print(f"[AirSim] Altitude change failed: {e}")
@@ -140,11 +166,12 @@ class AirSimController:
                 return True
             
             # Move to new position
-            self.client.moveToPositionAsync(
+            task = self.client.moveToPositionAsync(
                 float(x), float(y), float(z), float(self.move_speed)
-            ).join()
+            )
+            self._join_with_timeout(task, timeout=30.0, label="execute_decision")
             return True
-            
+
         except Exception as e:
             print(f"[AirSim] Move failed: {e}")
             return False
@@ -281,7 +308,8 @@ class AirSimController:
             new_yaw = current_yaw + math.radians(angle_degrees)
             
             # Rotate using rotateToYawAsync
-            self.client.rotateToYawAsync(math.degrees(new_yaw), duration).join()
+            task = self.client.rotateToYawAsync(math.degrees(new_yaw), duration)
+            self._join_with_timeout(task, timeout=10.0, label="rotate_yaw")
             return True
         except Exception as e:
             print(f"[AirSim] Rotation failed: {e}")
@@ -354,12 +382,13 @@ class AirSimController:
             if collision.has_collided:
                 log(f"[AVOID] Collision detected! Backing up...")
                 # Back up slightly
-                self.client.moveToPositionAsync(
+                backup = self.client.moveToPositionAsync(
                     float(pos[0] - dx * 1.0),
                     float(pos[1] - dy * 1.0),
                     float(pos[2]),
                     float(speed)
-                ).join()
+                )
+                self._join_with_timeout(backup, timeout=15.0, label="avoid_backup")
                 
                 # Turn left 90 degrees
                 log(f"[AVOID] Turning left 90 degrees...")
@@ -392,12 +421,14 @@ class AirSimController:
                     
                     # Back up
                     current = self.get_position()
-                    self.client.moveToPositionAsync(
+                    backup2 = self.client.moveToPositionAsync(
                         float(current[0] - dx * 1.5),
                         float(current[1] - dy * 1.5),
                         float(current[2]),
                         float(speed)
-                    ).join()
+                    )
+                    self._join_with_timeout(backup2, timeout=15.0,
+                                            label="avoid_backup_mid")
                     
                     # Turn left
                     log(f"[AVOID] Turning left to avoid obstacle...")
@@ -406,12 +437,13 @@ class AirSimController:
                 
                 time.sleep(0.05)  # Check every 50ms
             
-            # Wait for task to complete
+            # Wait for task to complete (should already be done or cancelled)
             try:
-                move_task.join()
-            except:
+                self._join_with_timeout(move_task, timeout=5.0,
+                                        label="avoid_final_join")
+            except Exception:
                 pass
-        
+
         return False, self.get_position()
     
     def explore_map(self, map_size_x, map_size_y, altitude, speed=1.5, 
@@ -470,9 +502,11 @@ class AirSimController:
             
             # First, go to altitude
             log(f"[EXPLORE] Going to altitude {altitude}m...")
-            self.client.moveToPositionAsync(
+            alt_task = self.client.moveToPositionAsync(
                 float(start_x), float(start_y), float(target_z), float(speed)
-            ).join()
+            )
+            self._join_with_timeout(alt_task, timeout=30.0,
+                                    label="explore_altitude")
             
             # Track trajectory for drawing
             prev_pos = self.get_position()
@@ -551,10 +585,11 @@ class AirSimController:
                     time.sleep(0.05)
                 
                 try:
-                    move_task.join()
-                except:
+                    self._join_with_timeout(move_task, timeout=5.0,
+                                            label="explore_step_join")
+                except Exception:
                     pass
-                
+
                 # Get new position and draw trajectory
                 current_pos = self.get_position()
                 self.draw_trajectory_line(prev_pos, current_pos, line_color, line_thickness)
@@ -568,9 +603,11 @@ class AirSimController:
                     # Back up
                     backup_x = current_pos[0] - dx * 1.5
                     backup_y = current_pos[1] - dy * 1.5
-                    self.client.moveToPositionAsync(
+                    bk = self.client.moveToPositionAsync(
                         float(backup_x), float(backup_y), float(target_z), float(speed)
-                    ).join()
+                    )
+                    self._join_with_timeout(bk, timeout=15.0,
+                                            label="explore_backup")
                     
                     # Draw backup trajectory
                     new_pos = self.get_position()
@@ -612,9 +649,11 @@ class AirSimController:
             
             # Return to start
             log(f"[EXPLORE] Returning to start position...")
-            self.client.moveToPositionAsync(
+            rth = self.client.moveToPositionAsync(
                 float(start_x), float(start_y), float(target_z), float(speed)
-            ).join()
+            )
+            self._join_with_timeout(rth, timeout=60.0,
+                                    label="explore_return_home")
             
             return True
             
@@ -666,10 +705,12 @@ class AirSimController:
             for i, (x, y, z, description) in enumerate(waypoints):
                 log(f"[SQUARE] Step {i+1}/5: {description}")
                 log(f"[SQUARE] Target: ({x:.1f}, {y:.1f}, {-z:.1f}m altitude)")
-                
-                self.client.moveToPositionAsync(
+
+                sq_task = self.client.moveToPositionAsync(
                     float(x), float(y), float(z), float(speed)
-                ).join()
+                )
+                self._join_with_timeout(sq_task, timeout=60.0,
+                                        label=f"square_step_{i+1}")
                 
                 # Get and log current position
                 pos = self.get_position()
@@ -733,16 +774,16 @@ class DroneNavigationSystem:
         self.running = True
         
         # Exploration parameters
-        ROOM_SIZE = 30        # meters - room dimension (square)
-        CELL_SIZE = 2.0       # meters - grid cell size
+        ROOM_SIZE = 50        # meters - initial estimate (auto-detected from lidar)
+        CELL_SIZE = 1.5       # meters - finer grid for better coverage
         FLIGHT_ALTITUDE = 3   # meters - flight altitude
         FLIGHT_SPEED = 1.5    # m/s - slow speed for stability
-        SAFE_DISTANCE = 3.0   # meters - minimum distance from walls
+        SAFE_DISTANCE = 1.5   # meters - minimum distance from walls
         
         try:
             self.ui.log_data("=" * 50)
             self.ui.log_data("GRID-BASED ROOM EXPLORATION")
-            self.ui.log_data(f"Room: {ROOM_SIZE}m x {ROOM_SIZE}m")
+            self.ui.log_data(f"Room: {ROOM_SIZE}m x {ROOM_SIZE}m (auto-detect enabled)")
             self.ui.log_data(f"Grid: {int(ROOM_SIZE/CELL_SIZE)}x{int(ROOM_SIZE/CELL_SIZE)} cells")
             self.ui.log_data(f"Altitude: {FLIGHT_ALTITUDE}m, Speed: {FLIGHT_SPEED}m/s")
             self.ui.log_data(f"Safe distance: {SAFE_DISTANCE}m")
@@ -766,8 +807,15 @@ class DroneNavigationSystem:
                 cell_size=CELL_SIZE,
                 altitude=FLIGHT_ALTITUDE,
                 speed=FLIGHT_SPEED,
-                safe_distance=SAFE_DISTANCE
+                safe_distance=SAFE_DISTANCE,
+                auto_room_size=True,
+                auto_room_padding=2.0,
+                scan_rotations=16,
+                visit_radius=3.0,
+                coverage_spacing=2.5,
             )
+            explorer.ply_output_path = "point_cloud.ply"
+            explorer.ply_voxel_size = 0.05
             
             # Run full exploration (takeoff -> explore -> return home -> land)
             explorer.run(
