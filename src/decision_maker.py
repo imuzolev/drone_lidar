@@ -2,7 +2,7 @@ import torch
 from torchvision import transforms
 from PIL import Image
 import os
-from decision_net import DecisionNet
+from .decision_net import DecisionNet
 
 class DecisionMaker:
     def __init__(self, model_path=None, simulation_mode=True):

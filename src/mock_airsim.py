@@ -72,19 +72,19 @@ class MultirotorClient:
         self.armed = arm
         print(f"[MOCK] Arm: {arm}")
 
-    def takeoffAsync(self):
+    def takeoffAsync(self, *args, **kwargs):
         print("[MOCK] Taking off...")
         self.z = -3.0
         self.flying = True
         return AsyncJob()
 
-    def landAsync(self):
+    def landAsync(self, *args, **kwargs):
         print("[MOCK] Landing...")
         self.z = 0.0
         self.flying = False
         return AsyncJob()
 
-    def hoverAsync(self):
+    def hoverAsync(self, *args, **kwargs):
         """Hold current position."""
         return AsyncJob()
 
@@ -112,7 +112,7 @@ class MultirotorClient:
         else:
             self._last_collided = False
 
-    def moveToPositionAsync(self, x, y, z, velocity):
+    def moveToPositionAsync(self, x, y, z, velocity, *args, **kwargs):
         # Clamp target to stay within walls (with small margin)
         margin = 0.1
         clamped_x = max(self.walls['x_min'] + margin, min(self.walls['x_max'] - margin, x))
@@ -131,7 +131,7 @@ class MultirotorClient:
         print(f"[MOCK] Moved to ({self.x:.2f}, {self.y:.2f}, {self.z:.2f})")
         return AsyncJob()
 
-    def moveByVelocityBodyFrameAsync(self, vx, vy, vz, duration):
+    def moveByVelocityBodyFrameAsync(self, vx, vy, vz, duration, *args, **kwargs):
         """Move in body frame: vx=forward, vy=right, vz=down."""
         dx = (vx * np.cos(self.yaw) - vy * np.sin(self.yaw)) * duration
         dy = (vx * np.sin(self.yaw) + vy * np.cos(self.yaw)) * duration
@@ -149,7 +149,7 @@ class MultirotorClient:
         self._check_wall_proximity()
         return AsyncJob()
 
-    def rotateByYawRateAsync(self, yaw_rate, duration):
+    def rotateByYawRateAsync(self, yaw_rate, duration, *args, **kwargs):
         """Rotate by yaw rate (degrees/second) for duration."""
         time.sleep(min(duration, 0.2))
         self.yaw += np.radians(yaw_rate * duration)
@@ -157,7 +157,7 @@ class MultirotorClient:
         print(f"[MOCK] Rotated to Yaw: {np.degrees(self.yaw):.1f} deg")
         return AsyncJob()
 
-    def rotateToYawAsync(self, yaw_deg, duration=1.0):
+    def rotateToYawAsync(self, yaw_deg, duration=1.0, *args, **kwargs):
         """Rotate to absolute yaw angle (degrees)."""
         time.sleep(min(duration, 0.2))
         self.yaw = math.radians(yaw_deg) % (2 * math.pi)
@@ -183,7 +183,7 @@ class MultirotorClient:
         """Clear all persistent markers (no-op in mock)."""
         pass
 
-    def getLidarData(self, lidar_name=""):
+    def getLidarData(self, lidar_name="", *args, **kwargs):
         """
         Simulate 360-degree lidar scan.
         Returns point cloud in body (sensor) frame.

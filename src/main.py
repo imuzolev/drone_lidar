@@ -776,7 +776,7 @@ class DroneNavigationSystem:
         # Exploration parameters
         ROOM_SIZE = 50        # meters - initial estimate (auto-detected from lidar)
         CELL_SIZE = 1.5       # meters - finer grid for better coverage
-        FLIGHT_ALTITUDE = 3   # meters - flight altitude
+        FLIGHT_ALTITUDE = 1   # meters - flight altitude
         FLIGHT_SPEED = 1.5    # m/s - slow speed for stability
         SAFE_DISTANCE = 1.5   # meters - minimum distance from walls
         

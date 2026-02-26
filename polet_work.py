@@ -29,10 +29,12 @@ import time
 import os
 import numpy as np
 import math
+import logging
+import threading
 from collections import deque
 import sys
 import argparse
-import threading
+import traceback
 
 try:
     from scipy.spatial import KDTree
@@ -50,21 +52,50 @@ try:
 except ImportError:
     try:
         from src import mock_airsim
-    except Exception:
-        try:
-            import importlib.util
-            _spec = importlib.util.spec_from_file_location(
-                "mock_airsim",
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "mock_airsim.py"))
-            mock_airsim = importlib.util.module_from_spec(_spec)
-            _spec.loader.exec_module(mock_airsim)
-        except Exception:
-            mock_airsim = None
+    except ImportError:
+        mock_airsim = None
 
 # Grid cell states
 UNEXPLORED = 0
 EXPLORED = 1   # Lidar ray passed through (known free space)
 WALL = 2
+
+
+class _SerializedAirSimTask:
+    """Serialize Async.join() to protect msgpackrpc IOLoop state."""
+
+    def __init__(self, task, rpc_lock):
+        self._task = task
+        self._rpc_lock = rpc_lock
+
+    def join(self):
+        with self._rpc_lock:
+            return self._task.join()
+
+    def __getattr__(self, name):
+        return getattr(self._task, name)
+
+
+class _SerializedAirSimClient:
+    """Serialize all client calls through a shared re-entrant lock."""
+
+    def __init__(self, client, rpc_lock):
+        self._client = client
+        self._rpc_lock = rpc_lock
+
+    def __getattr__(self, name):
+        attr = getattr(self._client, name)
+        if not callable(attr):
+            return attr
+
+        def wrapped(*args, **kwargs):
+            with self._rpc_lock:
+                result = attr(*args, **kwargs)
+            if name.endswith("Async") and hasattr(result, "join"):
+                return _SerializedAirSimTask(result, self._rpc_lock)
+            return result
+
+        return wrapped
 
 
 class AutonomousExplorer:
@@ -78,7 +109,7 @@ class AutonomousExplorer:
     """
 
     def __init__(self, client=None, use_mock=False, room_size=20.0,
-                 cell_size=0.5, altitude=0.0, speed=1.5, safe_distance=1.0,
+                 cell_size=2.0, altitude=3.0, speed=1.5, safe_distance=2.0,
                  require_sim=True, auto_room_size=False, auto_room_padding=1.0,
                  scan_rotations=12, visit_radius=2.5, coverage_spacing=3.0,
                  lidar_min_range=0.5, lidar_max_range=40.0,
@@ -86,7 +117,7 @@ class AutonomousExplorer:
                  sor_neighbors=20, sor_std_ratio=2.0,
                  ror_radius=0.5, ror_min_neighbors=5,
                  visualize_in_sim=True, viz_update_interval=3,
-                 multi_altitude_scan=False, scan_altitudes=None):
+                 log_file=None, log_level="INFO"):
         """
         Args:
             client:           Existing AirSim client (None => creates new).
@@ -112,12 +143,13 @@ class AutonomousExplorer:
             ror_min_neighbors: Min neighbours within ror_radius to keep point.
             visualize_in_sim: Draw debug overlay in UE viewport (grid, paths).
             viz_update_interval: Update grid overlay every N waypoints.
-            multi_altitude_scan: Enable multi-altitude 360° scan at each waypoint.
-            scan_altitudes:   List of altitudes (positive m) for multi-altitude scan.
         """
         # Logging
-        self.log = print
+        self._logger = self._create_logger(log_file, log_level)
+        self._last_error_log_ts = {}
+        self.log = self._log
         self.is_running_fn = lambda: True
+        self._rpc_lock = threading.RLock()
 
         # Connection
         self.use_mock = use_mock
@@ -127,6 +159,8 @@ class AutonomousExplorer:
 
         if not self.external_client:
             self._connect(use_mock)
+        else:
+            self.client = _SerializedAirSimClient(self.client, self._rpc_lock)
 
         # Grid parameters (rectangular support)
         self.room_size = room_size
@@ -169,10 +203,6 @@ class AutonomousExplorer:
         # State
         self.start_position = None
         self.trajectory_points = []
-        # Frontier targeting controls to avoid local oscillations.
-        self.min_frontier_distance_m = max(self.cell_size * 2.0, 2.0)
-        self.frontier_max_failures = 3
-        self.frontier_fail_counts = {}
 
         # Point cloud accumulation for PLY export
         self.all_lidar_points = []
@@ -182,28 +212,75 @@ class AutonomousExplorer:
         # In-sim visualization
         self.visualize_in_sim = bool(visualize_in_sim)
         self.viz_update_interval = max(1, int(viz_update_interval))
+        self._last_traj_plot_ts = 0.0
+        self.traj_plot_interval_s = 1.0
+        self.max_traj_points = 1200
+        self.traj_plot_window = 200
+        self.lightweight_scan_mode = False
 
-        # Multi-altitude scanning
-        self.multi_altitude_scan = bool(multi_altitude_scan)
-        if self.multi_altitude_scan:
-            if scan_altitudes:
-                self.scan_altitudes = sorted(
-                    [-abs(float(h)) for h in scan_altitudes], reverse=True
-                )
-            else:
-                self.scan_altitudes = sorted(
-                    [-0.5, -1.5, -2.5], reverse=True
-                )
+    def _create_logger(self, log_file, log_level):
+        """Create file logger for detailed diagnostics."""
+        logger = logging.getLogger(f"autonomous_explorer_{id(self)}")
+        logger.setLevel(getattr(logging, str(log_level).upper(), logging.INFO))
+        logger.propagate = False
+
+        if logger.handlers:
+            return logger
+
+        if not log_file:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            log_dir = os.path.join(os.getcwd(), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, f"exploration_{ts}.log")
         else:
-            self.scan_altitudes = []
-        self._altitude_fail_counts = {}
-        self._altitude_disable_after = 2
+            out_dir = os.path.dirname(os.path.abspath(log_file))
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
 
-        # Start transit at the lowest scan altitude (drone takes off here).
-        # After each scan, target_altitude is dynamically updated to the
-        # altitude where the scan ended — no wasted climbs or descents.
-        if self.multi_altitude_scan and self.scan_altitudes:
-            self.target_altitude = self.scan_altitudes[0]
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        ))
+        logger.addHandler(fh)
+
+        self._log_file = log_file
+        return logger
+
+    def _log(self, message):
+        """Log to console + file with timestamp."""
+        text = str(message)
+        ts = time.strftime("%H:%M:%S")
+        print(f"[{ts}] {text}")
+
+        upper = text.upper()
+        if "[ERROR]" in upper:
+            lvl = logging.ERROR
+        elif "[WARN]" in upper or "[TIMEOUT]" in upper:
+            lvl = logging.WARNING
+        else:
+            lvl = logging.INFO
+        try:
+            self._logger.log(lvl, text)
+        except Exception:
+            pass
+
+    def _log_throttled_error(self, key, message, exc=None, interval_s=5.0):
+        """Avoid flooding logs for high-frequency failure points."""
+        now = time.time()
+        prev = self._last_error_log_ts.get(key, 0.0)
+        if now - prev < interval_s:
+            return
+        self._last_error_log_ts[key] = now
+        if exc is None:
+            self.log(f"[WARN] {message}")
+            return
+        self.log(f"[WARN] {message}: {exc}")
+        try:
+            self._logger.error("Traceback for %s:\n%s", key, traceback.format_exc())
+        except Exception:
+            pass
 
     # ================================================================
     #  CONNECTION
@@ -214,8 +291,9 @@ class AutonomousExplorer:
         if not use_mock and airsim is not None:
             try:
                 self.log("[CONNECT] Connecting to AirSim...")
-                self.client = airsim.MultirotorClient()
-                self.client.confirmConnection()
+                raw_client = airsim.MultirotorClient()
+                raw_client.confirmConnection()
+                self.client = _SerializedAirSimClient(raw_client, self._rpc_lock)
                 self.log("[CONNECT] Connected to AirSim.")
                 self.client.reset()
                 import time as _t
@@ -227,6 +305,11 @@ class AutonomousExplorer:
                 return
             except Exception as e:
                 self.log(f"[ERROR] AirSim: {e}")
+                try:
+                    self._logger.error("AirSim connection traceback:\n%s",
+                                       traceback.format_exc())
+                except Exception:
+                    pass
                 if self.require_sim:
                     raise RuntimeError(
                         "Could not connect to AirSim. "
@@ -241,8 +324,37 @@ class AutonomousExplorer:
             )
 
         self.use_mock = True
-        self.client = mock_airsim.MultirotorClient()
+        self.client = _SerializedAirSimClient(mock_airsim.MultirotorClient(), self._rpc_lock)
         self.client.confirmConnection()
+
+    def _is_ioloop_running_error(self, exc):
+        return isinstance(exc, RuntimeError) and "IOLoop is already running" in str(exc)
+
+    def _recover_rpc_client(self, context="rpc"):
+        """Reconnect RPC session after msgpack loop corruption."""
+        if self.use_mock or airsim is None:
+            return False
+        if self.external_client:
+            self.log(f"[RPC] {context}: external client cannot be auto-reconnected.")
+            return False
+
+        self.log(f"[RPC] {context}: reconnecting AirSim client after IOLoop conflict...")
+        try:
+            raw_client = airsim.MultirotorClient()
+            raw_client.confirmConnection()
+            recovered = _SerializedAirSimClient(raw_client, self._rpc_lock)
+            recovered.enableApiControl(True)
+            recovered.armDisarm(True)
+            self.client = recovered
+            self.log("[RPC] Client session recovered.")
+            return True
+        except Exception as reconnect_exc:
+            self.log(f"[RPC] Reconnect failed: {reconnect_exc}")
+            try:
+                self._logger.error("RPC reconnect traceback:\n%s", traceback.format_exc())
+            except Exception:
+                pass
+            return False
 
     # ================================================================
     #  KEEPALIVE & HOVER HOLD
@@ -254,143 +366,33 @@ class AutonomousExplorer:
         Safe to call at any time — simply tells the drone to hold position."""
         try:
             self.client.hoverAsync()
-        except Exception:
-            pass
+        except Exception as e:
+            self._log_throttled_error("keepalive_hover", "hoverAsync failed", e, interval_s=10.0)
 
     # ================================================================
-    #  ASYNC NON-BLOCKING OPERATIONS
+    #  ASYNC JOIN WITH TIMEOUT
     # ================================================================
 
-    def _safe_move(self, target_x, target_y, target_z, velocity, timeout,
-                   task_name="move", check_2d=False):
-        """Non-blocking move to position using polling.
-        Sends an async move command and polls the drone's position until
-        it reaches the target or times out.
+    def _join_with_timeout(self, task, timeout=30.0, task_name="task"):
+        """Join an async AirSim task safely.
 
-        When check_2d=True the arrival check uses only XY distance,
-        so horizontal navigation succeeds even when the exact target
-        altitude is unreachable (common at low flight levels).
+        IMPORTANT:
+        msgpack-rpc client used by AirSim is not thread-safe and can throw
+        "IOLoop is already running" if two threads call RPC concurrently.
+        Therefore we must avoid running task.join() in a background thread.
+
+        This method keeps the timeout argument for API compatibility but
+        performs a single-threaded join to preserve client stability.
         """
+        _ = timeout
         try:
-            self.client.moveToPositionAsync(float(target_x), float(target_y), float(target_z), float(velocity))
+            task.join()
+            return True
         except Exception as e:
-            self.log(f"  [{task_name}] Error starting move: {e}")
+            if self._is_ioloop_running_error(e):
+                self._recover_rpc_client(task_name)
+            self.log(f"  [ERROR] '{task_name}' failed: {e}")
             return False
-
-        start_time = time.time()
-        last_log = start_time
-        last_reissue = start_time
-        dist = float('inf')
-        while time.time() - start_time < timeout:
-            if not self.is_running_fn():
-                return False
-            x, y, z = self.get_position()
-            if check_2d:
-                dist = math.sqrt((x - target_x)**2 + (y - target_y)**2)
-            else:
-                dist = math.sqrt((x - target_x)**2 + (y - target_y)**2 + (z - target_z)**2)
-            if dist < 0.5:
-                return True
-                
-            if time.time() - last_log > 2.0:
-                self.log(f"    [{task_name} debug] dist: {dist:.2f}m (current: {x:.1f}, {y:.1f}, {z:.1f} | target: {target_x:.1f}, {target_y:.1f}, {target_z:.1f})")
-                last_log = time.time()
-                
-            if time.time() - last_reissue > 5.0:
-                try:
-                    self.client.moveToPositionAsync(float(target_x), float(target_y), float(target_z), float(velocity))
-                except Exception:
-                    pass
-                last_reissue = time.time()
-
-            time.sleep(0.1)
-            
-        self.log(f"  [TIMEOUT] '{task_name}' exceeded {timeout:.0f}s — timeout reached. Last dist: {dist:.2f}m")
-        try:
-            self.client.cancelLastTask()
-            self.client.hoverAsync()
-        except Exception:
-            pass
-        return False
-
-    def _safe_rotate(self, yaw_deg, timeout, task_name="rotate"):
-        """Non-blocking rotate to yaw using polling."""
-        # AirSim API uses yaw as absolute degrees
-        try:
-            self.client.rotateToYawAsync(float(yaw_deg), timeout_sec=timeout, margin=5.0)
-        except Exception as e:
-            self.log(f"  [{task_name}] Error starting rotate: {e}")
-            return False
-
-        target_yaw_rad = math.radians(yaw_deg)
-        start_time = time.time()
-        last_log = start_time
-        last_reissue = start_time
-        while time.time() - start_time < timeout:
-            if not self.is_running_fn():
-                return False
-            current_yaw_rad = self.get_yaw()
-            # Normalize diff to [-pi, pi]
-            diff = (current_yaw_rad - target_yaw_rad + math.pi) % (2 * math.pi) - math.pi
-            if abs(diff) < 0.15:  # ~8.6 degrees tolerance
-                return True
-                
-            if time.time() - last_log > 2.0:
-                self.log(f"    [{task_name} debug] diff: {math.degrees(diff):.1f}deg (current: {math.degrees(current_yaw_rad):.1f} | target: {yaw_deg:.1f})")
-                last_log = time.time()
-                
-            if time.time() - last_reissue > 5.0:
-                try:
-                    self.client.rotateToYawAsync(float(yaw_deg), timeout_sec=timeout, margin=5.0)
-                except Exception:
-                    pass
-                last_reissue = time.time()
-                
-            time.sleep(0.1)
-
-        self.log(f"  [TIMEOUT] '{task_name}' exceeded {timeout:.0f}s — timeout reached. Last diff: {math.degrees(diff):.1f}deg")
-        return False
-
-    def _safe_takeoff(self, timeout=20.0):
-        """Non-blocking takeoff using polling."""
-        try:
-            self.client.takeoffAsync(timeout_sec=timeout)
-        except Exception as e:
-            self.log(f"  [FLIGHT] Error starting takeoff: {e}")
-            return False
-
-        start_time = time.time()
-        # Z is usually close to 0 on ground. We want to see it decrease (go up).
-        # Assuming takeoff brings it at least 1m up.
-        _, _, start_z = self.get_position()
-        while time.time() - start_time < timeout:
-            if not self.is_running_fn():
-                return False
-            _, _, current_z = self.get_position()
-            if current_z < start_z - 1.0:  # Altitude changed significantly
-                time.sleep(1.0) # Wait a bit to stabilize
-                return True
-            time.sleep(0.1)
-        return False
-
-    def _safe_land(self, timeout=30.0):
-        """Non-blocking landing using polling."""
-        try:
-            self.client.landAsync()
-        except Exception as e:
-            self.log(f"  [FLIGHT] Error starting landing: {e}")
-            return False
-
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            if not self.is_running_fn():
-                return False
-            # If drone is stable for 1s, it likely landed
-            if self._wait_for_stable(timeout=1.0, vel_threshold=0.05):
-                return True
-            time.sleep(0.5)
-        return False
-
 
     def _move_timeout(self, distance, speed):
         """Calculate a reasonable timeout for a move command (seconds)."""
@@ -425,7 +427,10 @@ class AutonomousExplorer:
 
                 if speed < vel_threshold and ang_speed < 0.1:
                     return True
-            except Exception:
+            except Exception as e:
+                self._log_throttled_error("wait_for_stable_gt",
+                                          "simGetGroundTruthKinematics failed during stabilization",
+                                          e, interval_s=10.0)
                 break
             time.sleep(0.05)
         return False
@@ -459,7 +464,11 @@ class AutonomousExplorer:
         angle_step = 360.0 / max(4, self.scan_rotations)
         for i in range(max(4, self.scan_rotations)):
             yaw = i * angle_step
-            self._safe_rotate(yaw, timeout=15.0, task_name="auto_room_rotate")
+            try:
+                task = self.client.rotateToYawAsync(yaw, 10.0)
+                self._join_with_timeout(task, timeout=8.0, task_name="auto_room_rotate")
+            except Exception:
+                pass
             self._wait_for_stable(timeout=1.0, vel_threshold=0.15)
             time.sleep(0.1)
             pts = self.get_lidar_points_world()
@@ -502,12 +511,6 @@ class AutonomousExplorer:
         pad = self.auto_room_padding
         size_x = span_x + 2.0 * pad
         size_y = span_y + 2.0 * pad
-
-        # Force a reasonable minimum size to prevent shrinking to just the visible floor
-        min_room_dim = 20.0
-        if size_x < min_room_dim or size_y < min_room_dim:
-             self.log(f"[AUTO ROOM] Detected area ({size_x:.1f}x{size_y:.1f}m) smaller than minimum {min_room_dim}m. Using default room size.")
-             return
 
         if size_x < self.cell_size * 3.0 or size_y < self.cell_size * 3.0:
             self.log("[AUTO ROOM] Detected area too small. Keeping default room size.")
@@ -637,8 +640,12 @@ class AutonomousExplorer:
                 state = self.client.simGetGroundTruthKinematics()
                 p = state.position
                 return p.x_val, p.y_val, p.z_val
-            except Exception:
-                pass
+            except Exception as e:
+                self._log_throttled_error(
+                    "get_position_ground_truth",
+                    "simGetGroundTruthKinematics failed, fallback to estimated state",
+                    e
+                )
         
         state = self.client.getMultirotorState()
         p = state.kinematics_estimated.position
@@ -654,8 +661,12 @@ class AutonomousExplorer:
                 siny = 2.0 * (o.w_val * o.z_val + o.x_val * o.y_val)
                 cosy = 1.0 - 2.0 * (o.y_val ** 2 + o.z_val ** 2)
                 return math.atan2(siny, cosy)
-            except Exception:
-                pass
+            except Exception as e:
+                self._log_throttled_error(
+                    "get_yaw_ground_truth",
+                    "simGetGroundTruthKinematics failed for yaw, fallback to estimated state",
+                    e
+                )
 
         state = self.client.getMultirotorState()
         o = state.kinematics_estimated.orientation
@@ -671,24 +682,38 @@ class AutonomousExplorer:
         """Record position and draw red trajectory line in UE5."""
         x, y, z = self.get_position()
 
-        if not self.use_mock and airsim is not None:
-            point = airsim.Vector3r(x, y, z)
-            self.trajectory_points.append(point)
-            if len(self.trajectory_points) >= 2:
-                try:
-                    # Plot only the last segment to avoid O(N^2) overhead and UE crashes
-                    last_segment = [self.trajectory_points[-2], self.trajectory_points[-1]]
-                    self.client.simPlotLineStrip(
-                        last_segment,
-                        color_rgba=[1.0, 0.0, 0.0, 1.0],
-                        thickness=8.0,
-                        duration=3600.0,  # 1 hour (effectively persistent)
-                        is_persistent=False
-                    )
-                except Exception:
-                    pass
-        else:
+        if self.use_mock or airsim is None:
             self.trajectory_points.append((x, y, z))
+            if len(self.trajectory_points) > self.max_traj_points:
+                self.trajectory_points = self.trajectory_points[-self.max_traj_points:]
+            return
+
+        point = airsim.Vector3r(x, y, z)
+        self.trajectory_points.append(point)
+        if len(self.trajectory_points) > self.max_traj_points:
+            self.trajectory_points = self.trajectory_points[-self.max_traj_points:]
+
+        # Skip UE debug drawing when visualization is disabled.
+        if not self.visualize_in_sim:
+            return
+        if len(self.trajectory_points) < 2:
+            return
+
+        now = time.time()
+        if now - self._last_traj_plot_ts < self.traj_plot_interval_s:
+            return
+        self._last_traj_plot_ts = now
+
+        try:
+            self.client.simPlotLineStrip(
+                self.trajectory_points[-self.traj_plot_window:],
+                color_rgba=[1.0, 0.0, 0.0, 0.95],
+                thickness=4.0,
+                duration=20.0,
+                is_persistent=False
+            )
+        except Exception:
+            pass
 
     # ================================================================
     #  IN-SIM DEBUG VISUALIZATION
@@ -873,8 +898,12 @@ class AutonomousExplorer:
                 state = self.client.simGetGroundTruthKinematics()
                 o = state.orientation
                 return o.w_val, o.x_val, o.y_val, o.z_val
-            except Exception:
-                pass
+            except Exception as e:
+                self._log_throttled_error(
+                    "get_orientation_ground_truth",
+                    "Ground-truth orientation failed, fallback to estimated orientation",
+                    e
+                )
         state = self.client.getMultirotorState()
         o = state.kinematics_estimated.orientation
         return o.w_val, o.x_val, o.y_val, o.z_val
@@ -886,7 +915,8 @@ class AutonomousExplorer:
         Returns numpy array (N, 3)."""
         try:
             lidar_data = self.client.getLidarData()
-        except Exception:
+        except Exception as e:
+            self._log_throttled_error("get_lidar_data", "getLidarData failed", e, interval_s=3.0)
             return np.array([]).reshape(0, 3)
 
         if len(lidar_data.point_cloud) < 3:
@@ -923,8 +953,6 @@ class AutonomousExplorer:
 
     def get_distance_in_direction(self, target_x, target_y):
         """Get minimum lidar distance in direction of (target_x, target_y).
-        Filters out floor/ceiling hits in body frame so that ground
-        reflections do not block navigation through narrow passages.
         Returns distance in meters, or inf."""
         x, y, _ = self.get_position()
         dx = target_x - x
@@ -944,15 +972,6 @@ class AutonomousExplorer:
             return float('inf')
 
         points = np.array(lidar_data.point_cloud, dtype=np.float32).reshape(-1, 3)
-
-        # Body-frame height filter: keep only points near flight plane.
-        # In NED body frame: Z > 0 = below drone (floor), Z < 0 = above (ceiling).
-        # Asymmetric: wide above (shelf tops), tight below (reject floor).
-        height_mask = (points[:, 2] >= -1.5) & (points[:, 2] <= 0.3)
-        points = points[height_mask]
-        if len(points) == 0:
-            return float('inf')
-
         yaw = self.get_yaw()
         body_angle = target_angle_world - yaw
         point_angles = np.arctan2(points[:, 1], points[:, 0])
@@ -1003,50 +1022,39 @@ class AutonomousExplorer:
             ply_pts = world_pts.copy()
 
             # Height-band filter: remove floor/ceiling noise
-            # Convert to positive altitude (ENU Z-up) for filtering
-            altitude = -z  # NED z is negative up
-            pts_z = -ply_pts[:, 2]
-
+            z_drone = z  # current drone altitude (NED negative)
             h_min = self.ply_height_min
             h_max = self.ply_height_max
-
-            # Default window: 3m below drone to 8m above drone (in altitude)
             if h_min is None:
-                h_min = altitude - 3.0
+                h_min = z_drone - 8.0  # ~8m below drone
             if h_max is None:
-                h_max = altitude + 8.0
+                h_max = z_drone + 3.0  # ~3m above drone
 
-            height_mask = (pts_z >= h_min) & (pts_z <= h_max)
+            height_mask = (ply_pts[:, 2] >= h_min) & (ply_pts[:, 2] <= h_max)
             ply_pts = ply_pts[height_mask]
 
             if len(ply_pts) > 0:
                 self.all_lidar_points.append(ply_pts)
 
-        # Two-pass update: ray-trace first (clears stale false walls),
-        # then mark wall endpoints (always wins over clearing).
+        # Height filter: only mark as WALL if lidar hit is near flight altitude.
+        # Floor/ceiling hits should not block 2D navigation grid.
+        z_wall_tolerance = 1.0  # meters above/below drone altitude
 
-        # --- Pass 1: Ray-trace all hits to mark free space ---
-        for pt in world_pts:
-            wgx, wgy = self.world_to_grid(pt[0], pt[1])
-            self._mark_ray_explored(drone_gx, drone_gy, wgx, wgy)
-
-        # --- Pass 2: Mark wall endpoints (height-filtered) ---
-        # Asymmetric band around drone altitude (NED: dz>0 = below, dz<0 = above).
-        # Wider above to catch shelf tops / beams; narrow below to reject floor.
         for pt in world_pts:
             wx, wy, wz = pt[0], pt[1], pt[2]
             wgx, wgy = self.world_to_grid(wx, wy)
             if 0 <= wgx < self.grid_dim_x and 0 <= wgy < self.grid_dim_y:
-                dz = wz - z
-                if -1.5 <= dz <= 0.5:
+                # Only mark as wall if the hit point is near flight altitude
+                # AND the cell hasn't been physically visited (prevents
+                # false walls from fragmenting known-safe space)
+                if abs(wz - z) <= z_wall_tolerance:
                     if not self.visited[wgx][wgy]:
                         self.grid[wgx][wgy] = WALL
+            # Always ray-trace to mark free space between drone and hit point
+            self._mark_ray_explored(drone_gx, drone_gy, wgx, wgy)
 
     def _mark_ray_explored(self, x0, y0, x1, y1):
-        """Mark cells along ray as EXPLORED (Bresenham). Skips endpoint.
-        Also clears stale WALL cells that a ray passes through — the ray
-        proves the cell is actually free space.  Collision-confirmed walls
-        (visited cells) are preserved."""
+        """Mark cells along ray as EXPLORED (Bresenham). Skips endpoint."""
         dx = abs(x1 - x0)
         dy = abs(y1 - y0)
         sx = 1 if x0 < x1 else -1
@@ -1057,12 +1065,9 @@ class AutonomousExplorer:
         while True:
             if cx == x1 and cy == y1:
                 break
-            if 0 <= cx < self.grid_dim_x and 0 <= cy < self.grid_dim_y:
-                cell = self.grid[cx][cy]
-                if cell == UNEXPLORED:
-                    self.grid[cx][cy] = EXPLORED
-                elif cell == WALL and not self.visited[cx][cy]:
-                    self.grid[cx][cy] = EXPLORED
+            if (0 <= cx < self.grid_dim_x and 0 <= cy < self.grid_dim_y
+                    and self.grid[cx][cy] == UNEXPLORED):
+                self.grid[cx][cy] = EXPLORED
             e2 = 2 * err
             if e2 > -dy:
                 err -= dy
@@ -1088,7 +1093,11 @@ class AutonomousExplorer:
             if not self.is_running_fn():
                 break
             yaw = i * angle_step
-            self._safe_rotate(yaw, timeout=15.0, task_name="scan_rotate")
+            try:
+                task = self.client.rotateToYawAsync(yaw, 10.0)
+                self._join_with_timeout(task, timeout=8.0, task_name="scan_rotate")
+            except Exception:
+                pass
             self._wait_for_stable(timeout=1.5, vel_threshold=0.1)
             time.sleep(0.15)
             self.update_grid_from_lidar()
@@ -1136,132 +1145,31 @@ class AutonomousExplorer:
         x, y, _ = self.get_position()
         gx, gy = self.world_to_grid(x, y)
         ratio = self._unexplored_ratio_at(gx, gy)
+        base_rotations = self.scan_rotations if not self.lightweight_scan_mode else min(self.scan_rotations, 8)
 
         if ratio > 0.15:
-            rotations = self.scan_rotations          # full (default 12)
+            rotations = base_rotations
         elif ratio > 0.05:
-            rotations = max(6, self.scan_rotations * 2 // 3)  # ~8
+            rotations = max(6, base_rotations * 2 // 3)
         else:
-            rotations = max(4, self.scan_rotations // 2)       # ~6
+            rotations = max(4, base_rotations // 2)
 
         angle_step = 360.0 / rotations
         for i in range(rotations):
             if not self.is_running_fn():
                 break
             yaw = i * angle_step
-            self._safe_rotate(yaw, timeout=15.0, task_name="adaptive_rotate")
+            try:
+                task = self.client.rotateToYawAsync(yaw, 10.0)
+                self._join_with_timeout(task, timeout=8.0, task_name="adaptive_rotate")
+            except Exception:
+                pass
             self._wait_for_stable(timeout=1.5, vel_threshold=0.1)
             time.sleep(0.15)
             self.update_grid_from_lidar()
 
         self.mark_cells_visited()
         self.record_trajectory()
-
-    # ================================================================
-    #  MULTI-ALTITUDE SCANNING
-    # ================================================================
-
-    def scan_multi_altitude(self):
-        """Perform 360° scans at multiple altitudes with zero wasted altitude changes.
-
-        Scan direction is chosen based on current altitude:
-        - Near bottom (e.g. after takeoff or bottom-end transit): scan bottom→top
-        - Near top (e.g. after top-end transit): scan top→bottom
-
-        After scanning, the drone stays at the last scanned altitude and
-        target_altitude is updated to match.  The next transit will happen
-        at this altitude — alternating between low and high cruising:
-
-            Point N:   scan 1→2→3, cruise at 3  ──►  Point N+1
-            Point N+1: scan 3→2→1, cruise at 1  ──►  Point N+2
-            Point N+2: scan 1→2→3, cruise at 3  ──►  ...
-        """
-        if not self.scan_altitudes:
-            self.scan_full()
-            return
-
-        x, y, z = self.get_position()
-        top_alt = self.scan_altitudes[-1]    # highest (most negative NED)
-        bottom_alt = self.scan_altitudes[0]  # lowest  (least negative NED)
-
-        available_alts = [
-            alt for alt in self.scan_altitudes
-            if self._altitude_fail_counts.get(alt, 0) < self._altitude_disable_after
-        ]
-        if not available_alts:
-            # If all levels were disabled, keep the extreme levels to preserve coverage.
-            available_alts = list(self.scan_altitudes)
-            self._altitude_fail_counts.clear()
-
-        if abs(z - bottom_alt) <= abs(z - top_alt):
-            scan_order = list(available_alts)
-            direction = "bottom-up"
-        else:
-            scan_order = list(reversed(available_alts))
-            direction = "top-down"
-
-        self.log(f"[MULTI-ALT] Scanning {len(scan_order)} levels ({direction}: "
-                 f"{abs(scan_order[0]):.1f}m -> {abs(scan_order[-1]):.1f}m)...")
-
-        last_alt = None
-        for i, alt in enumerate(scan_order):
-            if not self.is_running_fn():
-                break
-
-            self.log(f"[MULTI-ALT] Level {i+1}/{len(scan_order)}: "
-                     f"altitude {abs(alt):.1f}m...")
-
-            # Update x, y to current position so it goes straight up/down
-            # and doesn't try to fly back to where the multi-scan started
-            x, y, _ = self.get_position()
-            success = self._safe_move(x, y, alt, 1.5, 30.0, task_name="multi_alt_move")
-            if not success:
-                self.log(f"[MULTI-ALT] Timeout/Error at altitude {abs(alt):.1f}m, skipping.")
-                self._altitude_fail_counts[alt] = self._altitude_fail_counts.get(alt, 0) + 1
-                if self._altitude_fail_counts[alt] >= self._altitude_disable_after:
-                    self.log(
-                        f"[MULTI-ALT] Disabling altitude {abs(alt):.1f}m "
-                        f"for this run after {self._altitude_fail_counts[alt]} failures."
-                    )
-                continue
-
-            self._wait_for_stable(timeout=2.0, vel_threshold=0.1)
-            self.scan_full()
-            last_alt = alt
-
-        if last_alt is not None:
-            _, _, actual_z = self.get_position()
-            if abs(actual_z - last_alt) < 1.0:
-                self.target_altitude = last_alt
-            else:
-                self.target_altitude = actual_z
-                self.log(f"[MULTI-ALT] Altitude mismatch: requested "
-                         f"{abs(last_alt):.1f}m, actual {abs(actual_z):.1f}m. "
-                         f"Using actual altitude for cruising.")
-            self.log(f"[MULTI-ALT] Scan complete. Cruising altitude: "
-                     f"{abs(self.target_altitude):.1f}m")
-
-    def perform_scan(self, adaptive=True):
-        """Unified scan dispatcher: multi-altitude, adaptive, or full."""
-        if self.multi_altitude_scan:
-            self.scan_multi_altitude()
-        elif adaptive:
-            self.scan_adaptive()
-        else:
-            self.scan_full()
-
-    def perform_local_recovery_scan(self):
-        """Recovery scan at current altitude without vertical cycling.
-
-        Used when navigation repeatedly fails. In multi-alt mode we avoid
-        altitude transitions here because they can stall recovery if an
-        intermediate level is not reachable in the current scene/state.
-        """
-        if self.multi_altitude_scan:
-            self.log("[RECOVERY] Local 360° scan at current altitude (no multi-alt).")
-            self.scan_full()
-        else:
-            self.perform_scan(adaptive=False)
 
     # ================================================================
     #  COVERAGE PATH GENERATION (LAWNMOWER)
@@ -1708,23 +1616,10 @@ class AutonomousExplorer:
         """
         x, y, _ = self.get_position()
         start = self.world_to_grid(x, y)
-        min_frontier_cells = max(
-            1,
-            int(math.ceil(self.min_frontier_distance_m / max(self.cell_size, 1e-6)))
-        )
 
         queue = deque([start])
         seen = {start}
         parent = {start: None}
-        fallback_path = None
-
-        def _build_path(node):
-            path = []
-            while node is not None:
-                path.append(node)
-                node = parent[node]
-            path.reverse()
-            return path
 
         while queue:
             current = queue.popleft()
@@ -1742,15 +1637,13 @@ class AutonomousExplorer:
                         break
 
                 if is_frontier and not self.visited[gx][gy]:
-                    if self.frontier_fail_counts.get((gx, gy), 0) >= self.frontier_max_failures:
-                        continue
-
-                    path = _build_path(current)
-                    path_len = len(path) - 1
-                    if path_len >= min_frontier_cells:
-                        return path
-                    if fallback_path is None:
-                        fallback_path = path
+                    path = []
+                    node = current
+                    while node is not None:
+                        path.append(node)
+                        node = parent[node]
+                    path.reverse()
+                    return path
 
             # Expand BFS only through passable cells (EXPLORED or visited)
             for dgx, dgy in [(1, 0), (-1, 0), (0, 1), (0, -1),
@@ -1769,7 +1662,7 @@ class AutonomousExplorer:
                     parent[nb] = current
                     queue.append(nb)
 
-        return fallback_path
+        return None
 
     def _count_nearby_unexplored(self, gx, gy, radius=3):
         """Count UNEXPLORED cells within given grid-cell radius.
@@ -1895,6 +1788,18 @@ class AutonomousExplorer:
 
         clearance = wall_dist - dist_to_target  # space left after reaching target
 
+        # Hard block: we would overshoot INTO the wall
+        if clearance < self.safe_distance and wall_dist < dist_to_target + 0.5:
+            # Only mark the actual obstacle point as wall, not the target
+            if wall_dist < float('inf'):
+                angle = math.atan2(target_y - y, target_x - x)
+                wall_x = x + math.cos(angle) * wall_dist
+                wall_y = y + math.sin(angle) * wall_dist
+                wgx, wgy = self.world_to_grid(wall_x, wall_y)
+                if 0 <= wgx < self.grid_dim_x and 0 <= wgy < self.grid_dim_y:
+                    self.grid[wgx][wgy] = WALL
+            return False
+
         # If there's an obstacle ahead but we still have room, fly closer
         # but cap destination before the wall
         actual_target_x = target_x
@@ -1902,22 +1807,8 @@ class AutonomousExplorer:
         if wall_dist < float('inf') and clearance < self.safe_distance:
             # Move as close as possible: stop safe_distance before the wall
             safe_fly_dist = max(0.0, wall_dist - self.safe_distance)
-
-            # Narrow-passage fallback:
-            # allow a smaller safety margin to avoid deadlocks near shelving/walls.
-            min_motion_step = 0.35
-            if safe_fly_dist < min_motion_step:
-                relaxed_margin = max(0.2, self.safe_distance * 0.5)
-                relaxed_fly_dist = max(0.0, wall_dist - relaxed_margin)
-                if relaxed_fly_dist >= min_motion_step:
-                    self.log(
-                        f"  [NAV] Narrow passage: relaxing margin "
-                        f"{self.safe_distance:.2f}m -> {relaxed_margin:.2f}m"
-                    )
-                    safe_fly_dist = relaxed_fly_dist
-                else:
-                    self.log(f"  [NAV] Not enough safe clearance ({safe_fly_dist:.2f}m).")
-                    return False  # too close already
+            if safe_fly_dist < 0.3:
+                return False  # too close already
             angle = math.atan2(target_y - y, target_x - x)
             actual_target_x = x + math.cos(angle) * safe_fly_dist
             actual_target_y = y + math.sin(angle) * safe_fly_dist
@@ -1929,15 +1820,21 @@ class AutonomousExplorer:
         if not skip_yaw:
             yaw_deg = math.degrees(math.atan2(actual_target_y - y,
                                                actual_target_x - x))
-            self._safe_rotate(yaw_deg, timeout=5.0, task_name="nav_rotate")
+            try:
+                task = self.client.rotateToYawAsync(yaw_deg, 10.0)
+                self._join_with_timeout(task, timeout=5.0, task_name="nav_rotate")
+            except Exception:
+                pass
 
-        # Fly at adaptive speed (check_2d: XY arrival is enough for nav)
+        # Fly at adaptive speed
         fly_dist = math.sqrt((actual_target_x - x)**2 + (actual_target_y - y)**2)
-        if not self._safe_move(
-            actual_target_x, actual_target_y, self.target_altitude,
-            fly_speed, timeout=self._move_timeout(fly_dist, fly_speed),
-            task_name="nav_move", check_2d=True
-        ):
+        move_task = self.client.moveToPositionAsync(
+            float(actual_target_x), float(actual_target_y),
+            float(self.target_altitude), float(fly_speed)
+        )
+        if not self._join_with_timeout(move_task,
+                                       timeout=self._move_timeout(fly_dist, fly_speed),
+                                       task_name="nav_move"):
             self.log("  [NAV] Move timed out — stabilizing (NOT marking as wall)")
             self._keepalive_hover()
             self.record_trajectory()
@@ -1948,11 +1845,12 @@ class AutonomousExplorer:
             collision = self.client.simGetCollisionInfo()
             if collision.has_collided:
                 self.log("  [COLLISION] Backing up...")
-                self._safe_move(
-                    x, y, self.target_altitude, 1.0,
-                    timeout=15.0, task_name="collision_backup",
-                    check_2d=True
+                backup_task = self.client.moveToPositionAsync(
+                    float(x), float(y),
+                    float(self.target_altitude), 1.0
                 )
+                self._join_with_timeout(backup_task, timeout=15.0,
+                                        task_name="collision_backup")
                 self.grid[target_gx][target_gy] = WALL
                 self.record_trajectory()
                 return False
@@ -1990,7 +1888,6 @@ class AutonomousExplorer:
                 return False
 
         if start_gx == target_gx and start_gy == target_gy:
-            self.mark_cells_visited()
             return True
 
         # Try direct flight if grid line is clear
@@ -2046,9 +1943,13 @@ class AutonomousExplorer:
     def takeoff(self):
         """Take off and ascend to exploration altitude."""
         self.log("[FLIGHT] Taking off...")
-        if not self._safe_takeoff(timeout=20.0):
+        takeoff_task = self.client.takeoffAsync()
+        if not self._join_with_timeout(takeoff_task, timeout=20.0,
+                                       task_name="takeoff"):
             self.log("[FLIGHT] Takeoff timed out — retrying once...")
-            self._safe_takeoff(timeout=15.0)
+            takeoff_task = self.client.takeoffAsync()
+            self._join_with_timeout(takeoff_task, timeout=15.0,
+                                    task_name="takeoff_retry")
 
         state = self.client.getMultirotorState()
         self.start_position = state.kinematics_estimated.position
@@ -2057,22 +1958,15 @@ class AutonomousExplorer:
 
         self.record_trajectory()
 
-        # When multi-altitude scan is active, ascend to the first (lowest)
-        # scan altitude instead of cruising — avoids the "takeoff then drop" effect.
-        if self.multi_altitude_scan and self.scan_altitudes:
-            initial_alt = self.scan_altitudes[0]
-        else:
-            initial_alt = self.target_altitude
-
-        self.log(f"[FLIGHT] Ascending to {abs(initial_alt):.1f}m...")
-        if not self._safe_move(
+        self.log(f"[FLIGHT] Ascending to {abs(self.target_altitude):.0f}m...")
+        ascend_task = self.client.moveToPositionAsync(
             self.start_position.x_val,
             self.start_position.y_val,
-            initial_alt,
-            1.5, timeout=20.0, task_name="ascend"
-        ):
-            self.log("[FLIGHT] Ascend timed out.")
-            
+            self.target_altitude,
+            2.0
+        )
+        self._join_with_timeout(ascend_task, timeout=20.0,
+                                task_name="ascend_to_altitude")
         self.record_trajectory()
         self.log("[FLIGHT] At target altitude. Ready to explore.")
 
@@ -2097,14 +1991,18 @@ class AutonomousExplorer:
             safe_alt = min(self.target_altitude - 5.0, -10.0)
 
             self.log(f"[FLIGHT] Ascending to safe altitude {abs(safe_alt):.1f}m...")
-            self._safe_move(x, y, safe_alt, 2.0, timeout=20.0, task_name="rth_ascend")
+            t1 = self.client.moveToPositionAsync(x, y, safe_alt, 2.0)
+            self._join_with_timeout(t1, timeout=20.0, task_name="rth_ascend")
 
             fly_dist = math.sqrt((sx - x)**2 + (sy - y)**2)
             self.log(f"[FLIGHT] Flying over to start...")
-            self._safe_move(sx, sy, safe_alt, self.speed, timeout=self._move_timeout(fly_dist, self.speed), task_name="rth_fly_over", check_2d=True)
+            t2 = self.client.moveToPositionAsync(sx, sy, safe_alt, self.speed)
+            self._join_with_timeout(t2, timeout=self._move_timeout(fly_dist, self.speed),
+                                    task_name="rth_fly_over")
 
             self.log(f"[FLIGHT] Descending to approach altitude...")
-            self._safe_move(sx, sy, self.target_altitude, 2.0, timeout=20.0, task_name="rth_descend")
+            t3 = self.client.moveToPositionAsync(sx, sy, self.target_altitude, 2.0)
+            self._join_with_timeout(t3, timeout=20.0, task_name="rth_descend")
 
         self.record_trajectory()
 
@@ -2121,18 +2019,26 @@ class AutonomousExplorer:
         while current_alt > 0.8:
             current_alt *= 0.5
             self.log(f"[FLIGHT] Descending to {current_alt:.1f}m...")
-            self._safe_move(sx, sy, -current_alt, 0.8, timeout=15.0, task_name="gradual_descent")
+            desc_task = self.client.moveToPositionAsync(
+                sx, sy, float(-current_alt), 0.8
+            )
+            self._join_with_timeout(desc_task, timeout=15.0,
+                                    task_name="gradual_descent")
             time.sleep(0.2)
 
         self.log("[FLIGHT] Descending to 0.3m...")
-        self._safe_move(sx, sy, -0.3, 0.5, timeout=15.0, task_name="final_descent")
+        final_desc = self.client.moveToPositionAsync(sx, sy, -0.3, 0.5)
+        self._join_with_timeout(final_desc, timeout=15.0,
+                                task_name="final_descent")
         time.sleep(0.2)
         self.record_trajectory()
 
         # Land with timeout
         self.log("[FLIGHT] Landing...")
         try:
-            self._safe_land(timeout=30.0)
+            land_task = self.client.landAsync()
+            self._join_with_timeout(land_task, timeout=30.0,
+                                    task_name="landing")
         except Exception as e:
             self.log(f"[FLIGHT] Landing exception (non-critical): {e}")
         self.record_trajectory()
@@ -2362,7 +2268,7 @@ class AutonomousExplorer:
             f.write("end_header\n")
             for i in range(len(all_pts)):
                 f.write(f"{all_pts[i, 0]:.4f} {all_pts[i, 1]:.4f} "
-                        f"{-all_pts[i, 2]:.4f} "
+                        f"{all_pts[i, 2]:.4f} "
                         f"{colors[i, 0]} {colors[i, 1]} {colors[i, 2]}\n")
 
         file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
@@ -2373,26 +2279,6 @@ class AutonomousExplorer:
     # ================================================================
     #  MAIN EXPLORATION LOOP
     # ================================================================
-
-    def perform_random_move(self):
-        """Move to a random nearby valid cell to break loops."""
-        import random
-        x, y, _ = self.get_position()
-        gx, gy = self.world_to_grid(x, y)
-        candidates = []
-        for dx in range(-5, 6):
-            for dy in range(-5, 6):
-                nx, ny = gx + dx, gy + dy
-                if (0 <= nx < self.grid_dim_x and 0 <= ny < self.grid_dim_y and
-                        self.grid[nx][ny] != WALL):
-                    candidates.append((nx, ny))
-        
-        if candidates:
-            target_gx, target_gy = random.choice(candidates)
-            wx, wy = self.grid_to_world(target_gx, target_gy)
-            self.log(f"[STUCK] Random move to ({wx:.1f}, {wy:.1f})")
-            self.navigate_to_world(wx, wy)
-            self.mark_cells_visited()
 
     def explore_loop(self):
         """
@@ -2418,7 +2304,7 @@ class AutonomousExplorer:
         self.log("  PHASE 1: Initial 360° scan")
         self.log("=" * 60)
         self.visualize_phase_label("PHASE 1: Initial Scan")
-        self.perform_scan(adaptive=False)
+        self.scan_full()
         self.visualize_grid_in_sim()
 
         free_count = int(np.sum(self.grid == EXPLORED))
@@ -2439,11 +2325,6 @@ class AutonomousExplorer:
         consec_fails = 0
         max_consec_fails = 20
         last_log_step = 0
-        
-        # Stuck detection
-        last_target_gx = -1
-        last_target_gy = -1
-        stuck_counter = 0
 
         while self.is_running_fn():
             self._keepalive_hover()
@@ -2456,20 +2337,6 @@ class AutonomousExplorer:
 
             frontier_steps += 1
             target_gx, target_gy = path[-1]
-            
-            # Check if stuck
-            if target_gx == last_target_gx and target_gy == last_target_gy:
-                stuck_counter += 1
-            else:
-                stuck_counter = 0
-            last_target_gx, last_target_gy = target_gx, target_gy
-            
-            if stuck_counter > 3:
-                self.log(f"[STUCK] Target ({target_gx}, {target_gy}) repeated {stuck_counter} times. Forcing random move.")
-                self.perform_random_move()
-                stuck_counter = 0
-                continue
-
             target_wx, target_wy = self.grid_to_world(target_gx, target_gy)
 
             # Show target in viewport
@@ -2480,28 +2347,23 @@ class AutonomousExplorer:
 
             if success:
                 consec_fails = 0
-                self.frontier_fail_counts.pop((target_gx, target_gy), None)
                 self._wait_for_stable(timeout=2.0, vel_threshold=0.1)
-                self.perform_scan(adaptive=True)
+                self.scan_adaptive()
 
                 if frontier_steps % self.viz_update_interval == 0:
                     self.visualize_grid_in_sim()
             else:
                 consec_fails += 1
+                # Mark this cell as visited so we don't retry it
                 if (0 <= target_gx < self.grid_dim_x and
                         0 <= target_gy < self.grid_dim_y and
                         self.grid[target_gx][target_gy] != WALL):
-                    key = (target_gx, target_gy)
-                    fail_count = self.frontier_fail_counts.get(key, 0) + 1
-                    self.frontier_fail_counts[key] = fail_count
-                    if fail_count >= self.frontier_max_failures:
-                        self.visited[target_gx][target_gy] = True
+                    self.visited[target_gx][target_gy] = True
 
                 if consec_fails >= max_consec_fails:
                     self.log(f"[PHASE 2] {consec_fails} consecutive failures. "
                              f"Rescanning surroundings...")
-                    self.perform_random_move()
-                    self.perform_local_recovery_scan()
+                    self.scan_full()
                     consec_fails = 0
 
             # Log progress periodically
@@ -2531,6 +2393,10 @@ class AutonomousExplorer:
         self.log("=" * 60)
         self.log("  PHASE 3: Coverage pass (visiting remaining areas)")
         self.log("=" * 60)
+        if self.visualize_in_sim:
+            self.log("[STABILITY] Phase 3: disabling UE debug visualization.")
+        self.visualize_in_sim = False
+        self.lightweight_scan_mode = True
         self.visualize_phase_label("PHASE 3: Coverage Pass")
         self._keepalive_hover()
 
@@ -2539,11 +2405,6 @@ class AutonomousExplorer:
         rescan_count = 0
         max_rescans = 5
         target_coverage_pct = 95.0
-
-        # Stuck detection for Phase 3
-        last_target_gx = -1
-        last_target_gy = -1
-        stuck_counter = 0
 
         while self.is_running_fn():
             # Check coverage
@@ -2564,7 +2425,7 @@ class AutonomousExplorer:
                 if rescan_count <= max_rescans:
                     self.log(f"[PHASE 3] No path found — rescanning "
                              f"({rescan_count}/{max_rescans})...")
-                    self.perform_scan(adaptive=True)
+                    self.scan_adaptive()
                     self.update_grid_from_lidar(collect_for_ply=True)
                     continue
                 self.log("[PHASE 3] No more reachable unvisited cells.")
@@ -2572,20 +2433,6 @@ class AutonomousExplorer:
 
             coverage_steps += 1
             target_gx, target_gy = path[-1]
-            
-            # Check if stuck
-            if target_gx == last_target_gx and target_gy == last_target_gy:
-                stuck_counter += 1
-            else:
-                stuck_counter = 0
-            last_target_gx, last_target_gy = target_gx, target_gy
-            
-            if stuck_counter > 3:
-                self.log(f"[STUCK] Phase 3 Target ({target_gx}, {target_gy}) repeated {stuck_counter} times. Forcing random move.")
-                self.perform_random_move()
-                stuck_counter = 0
-                continue
-
             target_wx, target_wy = self.grid_to_world(target_gx, target_gy)
             self.visualize_current_target(target_wx, target_wy,
                                           bfs_path=path)
@@ -2595,7 +2442,7 @@ class AutonomousExplorer:
             if success:
                 consec_fails = 0
                 self._wait_for_stable(timeout=2.0, vel_threshold=0.1)
-                self.perform_scan(adaptive=True)
+                self.scan_adaptive()
                 if coverage_steps % self.viz_update_interval == 0:
                     self.visualize_grid_in_sim()
             else:
@@ -2611,8 +2458,7 @@ class AutonomousExplorer:
                                  f"failures — rescanning "
                                  f"({rescan_count}/{max_rescans})...")
                         consec_fails = 0
-                        self.perform_random_move()
-                        self.perform_local_recovery_scan()
+                        self.scan_adaptive()
                         self.update_grid_from_lidar(collect_for_ply=True)
                         continue
                     self.log("[PHASE 3] Too many failures — "
@@ -2628,6 +2474,7 @@ class AutonomousExplorer:
             self.log(f"[PHASE 3] Coverage pass: {coverage_steps} additional stops")
         else:
             self.log("[PHASE 3] No additional coverage needed!")
+        self.lightweight_scan_mode = False
 
         # ---- Final stats ----
         visited_count = int(np.sum(self.visited & (self.grid == EXPLORED)))
@@ -2652,12 +2499,6 @@ class AutonomousExplorer:
     #  RUN (FULL LIFECYCLE)
     # ================================================================
 
-    def _start_hud_thread(self):
-        """Start a background thread to update the HUD with altitude."""
-        # Removed because running a background thread using the same AirSim client
-        # causes 'IOLoop is already running' conflicts with msgpack-rpc.
-        pass
-
     def run(self, log_callback=None, running_check=None):
         """Full exploration lifecycle."""
         if log_callback:
@@ -2666,6 +2507,8 @@ class AutonomousExplorer:
             self.is_running_fn = running_check
 
         try:
+            if hasattr(self, "_log_file"):
+                self.log(f"[INFO] Diagnostic log file: {self._log_file}")
             if not self.external_client:
                 self.client.enableApiControl(True)
                 self.client.armDisarm(True)
@@ -2674,11 +2517,6 @@ class AutonomousExplorer:
 
             if self.auto_room_size:
                 self._auto_configure_room_from_lidar()
-            
-            self.log(f"[RUN] Final Room Size: {self.room_size_x:.1f}x{self.room_size_y:.1f}m")
-            self.log(f"[RUN] Grid Dimensions: {self.grid_dim_x}x{self.grid_dim_y}")
-
-            self._start_hud_thread()
 
             self.explore_loop()
 
@@ -2689,20 +2527,26 @@ class AutonomousExplorer:
 
         except Exception as e:
             self.log(f"[ERROR] Exploration failed: {e}")
-            import traceback
-            traceback.print_exc()
+            tb = traceback.format_exc()
+            self.log(tb.rstrip())
             try:
-                self.log("[EMERGENCY] Attempting emergency landing...")
-                self._safe_land(timeout=20.0)
+                self._logger.error("Unhandled exception traceback:\n%s", tb)
             except Exception:
                 pass
+            try:
+                self.log("[EMERGENCY] Attempting emergency landing...")
+                emg_task = self.client.landAsync()
+                self._join_with_timeout(emg_task, timeout=20.0,
+                                        task_name="emergency_land")
+            except Exception as emg_e:
+                self.log(f"[ERROR] Emergency landing failed: {emg_e}")
         finally:
             if not self.external_client:
                 try:
                     self.client.armDisarm(False)
                     self.client.enableApiControl(False)
-                except Exception:
-                    pass
+                except Exception as disarm_e:
+                    self.log(f"[WARN] Cleanup failed (arm/api control): {disarm_e}")
             self.log("[INFO] Exploration session ended.")
 
 
@@ -2716,21 +2560,20 @@ if __name__ == "__main__":
     )
     parser.add_argument("--mock", action="store_true",
                         help="Use mock AirSim environment")
-    parser.add_argument("--no-mock-fallback", action="store_false", dest="allow_mock_fallback",
-                        help="Disable mock fallback if AirSim unavailable")
-    parser.set_defaults(allow_mock_fallback=True)
+    parser.add_argument("--allow-mock-fallback", action="store_true",
+                        help="Allow mock fallback if AirSim unavailable")
     parser.add_argument("--room-size", type=float, default=200.0,
                         help="Max map size in meters (default: 200, covers most warehouses)")
-    parser.add_argument("--cell-size", type=float, default=0.5,
-                        help="Grid cell size in meters (default: 0.5)")
-    parser.add_argument("--altitude", type=float, default=0.0,
-                        help="Flight altitude in meters (default: 0)")
+    parser.add_argument("--cell-size", type=float, default=2.0,
+                        help="Grid cell size in meters (default: 2)")
+    parser.add_argument("--altitude", type=float, default=2.0,
+                        help="Flight altitude in meters (default: 2)")
     parser.add_argument("--speed", type=float, default=2.0,
                         help="Flight speed m/s (default: 2)")
-    parser.add_argument("--safe-distance", type=float, default=0.5,
-                        help="Min obstacle distance in meters (default: 0.5)")
-    parser.add_argument("--auto-room-size", action="store_true", default=True,
-                        help="Auto-detect building bounds from initial lidar scan (default: ON)")
+    parser.add_argument("--safe-distance", type=float, default=1.5,
+                        help="Min obstacle distance in meters (default: 1.5)")
+    parser.add_argument("--auto-room-size", action="store_true",
+                        help="Auto-detect building bounds from initial lidar scan")
     parser.add_argument("--auto-room-padding", type=float, default=2.0,
                         help="Extra map padding when auto-detecting (default: 2)")
     parser.add_argument("--scan-rotations", type=int, default=16,
@@ -2752,9 +2595,9 @@ if __name__ == "__main__":
     parser.add_argument("--lidar-max-range", type=float, default=40.0,
                         help="Max lidar range in meters, farther points discarded (default: 40)")
     parser.add_argument("--ply-height-min", type=float, default=None,
-                        help="Min Altitude for PLY points (positive up, default: auto, drone_alt - 3m)")
+                        help="Min Z for PLY points (default: auto, drone_z - 8m)")
     parser.add_argument("--ply-height-max", type=float, default=None,
-                        help="Max Altitude for PLY points (positive up, default: auto, drone_alt + 8m)")
+                        help="Max Z for PLY points (default: auto, drone_z + 3m)")
     parser.add_argument("--sor-neighbors", type=int, default=20,
                         help="Statistical Outlier Removal: k-neighbours (default: 20)")
     parser.add_argument("--sor-std", type=float, default=2.0,
@@ -2773,13 +2616,11 @@ if __name__ == "__main__":
                         help="Disable in-sim debug visualization overlay")
     parser.add_argument("--viz-interval", type=int, default=3,
                         help="Update grid overlay every N waypoints (default: 3)")
-
-    # Multi-altitude scan arguments
-    parser.add_argument("--multi-altitude-scan", action="store_true", default=True,
-                        help="Enable multi-altitude 360° scan at each waypoint (default: ON)")
-    parser.add_argument("--scan-altitudes", nargs="+", type=float,
-                        help="Altitudes in meters for multi-scan (e.g. 0.5 3.0 5.0)")
-
+    parser.add_argument("--log-file", type=str, default=None,
+                        help="Path to diagnostic log file (default: ./logs/exploration_*.log)")
+    parser.add_argument("--log-level", type=str, default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="Diagnostic log verbosity (default: INFO)")
     args = parser.parse_args()
 
     explorer = AutonomousExplorer(
@@ -2805,8 +2646,8 @@ if __name__ == "__main__":
         ror_min_neighbors=0 if args.no_ror else args.ror_min_neighbors,
         visualize_in_sim=not args.no_viz,
         viz_update_interval=args.viz_interval,
-        multi_altitude_scan=args.multi_altitude_scan,
-        scan_altitudes=args.scan_altitudes,
+        log_file=args.log_file,
+        log_level=args.log_level,
     )
 
     if not args.no_ply:
