@@ -455,7 +455,7 @@ class AirSimController:
         - Flies in exploration pattern
         - Detects obstacles using collision sensor
         - When obstacle hit: backs up, turns left 90°, continues
-        - Draws red trajectory line in UE5
+        - No trajectory drawing in UE5
         
         Args:
             map_size_x: Map size in X direction (meters)
@@ -480,9 +480,6 @@ class AirSimController:
             return True
         
         try:
-            # Clear any previous trajectory
-            self.clear_trajectory()
-            
             # Get starting position
             state = self.client.getMultirotorState()
             start_pos = state.kinematics_estimated.position
@@ -508,13 +505,9 @@ class AirSimController:
             self._join_with_timeout(alt_task, timeout=30.0,
                                     label="explore_altitude")
             
-            # Track trajectory for drawing
+            # Track trajectory for distance calculation
             prev_pos = self.get_position()
             trajectory_points = [prev_pos.copy()]
-            
-            # Trajectory line color (bright red)
-            line_color = [1.0, 0.0, 0.0, 1.0]  # RGBA
-            line_thickness = 8.0
             
             # Exploration using wall-following algorithm
             # Direction: 0=+X, 1=+Y, 2=-X, 3=-Y
@@ -590,9 +583,8 @@ class AirSimController:
                 except Exception:
                     pass
 
-                # Get new position and draw trajectory
+                # Get new position (no red trajectory drawing)
                 current_pos = self.get_position()
-                self.draw_trajectory_line(prev_pos, current_pos, line_color, line_thickness)
                 trajectory_points.append(current_pos.copy())
                 prev_pos = current_pos.copy()
                 
@@ -609,9 +601,9 @@ class AirSimController:
                     self._join_with_timeout(bk, timeout=15.0,
                                             label="explore_backup")
                     
-                    # Draw backup trajectory
+                    # Update position after backup (no trajectory drawing)
                     new_pos = self.get_position()
-                    self.draw_trajectory_line(prev_pos, new_pos, [1.0, 0.5, 0.0, 1.0], line_thickness)  # Orange for backup
+                    trajectory_points.append(new_pos.copy())
                     prev_pos = new_pos.copy()
                     
                     # Turn left 90 degrees
@@ -778,7 +770,7 @@ class DroneNavigationSystem:
         CELL_SIZE = 1.5       # meters - finer grid for better coverage
         FLIGHT_ALTITUDE = 1   # meters - flight altitude
         FLIGHT_SPEED = 1.5    # m/s - slow speed for stability
-        SAFE_DISTANCE = 1.5   # meters - minimum distance from walls
+        SAFE_DISTANCE = 1.0   # meters - minimum distance from walls
         
         try:
             self.ui.log_data("=" * 50)
@@ -787,7 +779,7 @@ class DroneNavigationSystem:
             self.ui.log_data(f"Grid: {int(ROOM_SIZE/CELL_SIZE)}x{int(ROOM_SIZE/CELL_SIZE)} cells")
             self.ui.log_data(f"Altitude: {FLIGHT_ALTITUDE}m, Speed: {FLIGHT_SPEED}m/s")
             self.ui.log_data(f"Safe distance: {SAFE_DISTANCE}m")
-            self.ui.log_data("Red trajectory line will be drawn in UE5!")
+            self.ui.log_data("Trajectory recording enabled (no red line in UE5)")
             self.ui.log_data("=" * 50)
             
             # Connect to AirSim
